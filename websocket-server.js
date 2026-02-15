@@ -99,6 +99,9 @@ wss.on('connection', (ws) => {
 });
 
 function handleMessage(ws, socketId, msg) {
+  // Log all messages for debugging
+  console.log(`📨 [${socketId}] ${msg.type}`);
+  
   switch (msg.type) {
     case 'host':
       handleHost(ws, socketId, msg);
@@ -119,8 +122,10 @@ function handleMessage(ws, socketId, msg) {
       handleDisconnect(socketId);
       break;
     default:
-      // Relay any other messages to room
+      // Relay all other messages (tank_state, tank_hit, barrier_place, barrier_hit, CTF, etc)
+      console.log(`🔁 Relaying ${msg.type} to room`);
       relayToRoom(socketId, msg);
+      break;
   }
 }
 
