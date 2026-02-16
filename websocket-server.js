@@ -11,8 +11,13 @@ const WebSocket = require('ws');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-app.use(cors());
+// Explicit CORS — allow all origins (game is served from any domain/file)
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
+app.options('*', cors());
 app.use(express.json());
+
+// Health check route Railway uses to verify the service is alive
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
