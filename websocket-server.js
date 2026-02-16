@@ -520,11 +520,9 @@ app.get('/api/stats', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// START
+// START — bind to 0.0.0.0 so Railway can reach it, init rooms after bind
 // ─────────────────────────────────────────────────────────────
-initPermanentRooms();
-
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔══════════════════════════════════════════════╗
 ║   LUNAFYRE SERVER v3.0 ONLINE                ║
@@ -535,6 +533,8 @@ server.listen(PORT, () => {
 ║   Time sync: SERVER-AUTHORITATIVE            ║
 ╚══════════════════════════════════════════════╝
   `);
+  // Init rooms AFTER server is bound — Railway health check passes first
+  initPermanentRooms();
 });
 
 process.on('SIGTERM', () => {
