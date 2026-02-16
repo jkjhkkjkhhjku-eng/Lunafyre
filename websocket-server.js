@@ -1,544 +1,365 @@
-// ============================================
-// LUNAFYRE WEBSOCKET GAME SERVER v3.0
-// Server-authoritative time, permanent rooms, 50-player cap, friend squads
-// ============================================
+// ============================================================
+//  LUNAFYRE SERVER v3.0 — MATCHMAKING EDITION
+//  Server-authoritative timer, scores, auto-room, party system
+// ============================================================
 
 const express = require('express');
-const cors = require('cors');
-const http = require('http');
+const cors    = require('cors');
+const http    = require('http');
 const WebSocket = require('ws');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 8080;
-
-// Explicit CORS — allow all origins (game is served from any domain/file)
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
-app.options('*', cors());
+app.use(cors());
 app.use(express.json());
 
-// Health check route Railway uses to verify the service is alive
-app.get('/health', (req, res) => res.json({ ok: true }));
-
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+// perMessageDeflate: false — lower CPU, lower latency for small frames
+const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 
-// ─────────────────────────────────────────────────────────────
-// PERMANENT ROOM CONFIGURATION
-// ─────────────────────────────────────────────────────────────
-const MAX_PLAYERS_PER_ROOM = 50;
-const MAX_PER_TEAM = 25;
+// ── CONSTANTS ─────────────────────────────────────────────────
+const MAX_PER_TEAM   = 25;
+const TDM_TIME       = 1200;   // 20 min in seconds
+const CTF_TIME       = 1080;   // 18 min in seconds
+const TDM_WIN_SCORE  = 300;
+const CTF_WIN_SCORE  = 10;
+const TICK_MS        = 1000;   // server timer tick
+const STATE_THROTTLE = 50;     // ms between state relays per player (anti-flood)
 
-const GAME_CONFIG = {
-  tdm: {
-    winScore: 300,
-    duration: 20 * 60,  // 20 minutes in seconds
-    label: 'TEAM DEATHMATCH'
-  },
-  ctf: {
-    winScore: 10,
-    duration: 18 * 60,  // 18 minutes in seconds
-    label: 'CAPTURE THE FLAG'
-  }
-};
+// ── DATA ──────────────────────────────────────────────────────
+// rooms: id → { id, mode, red, blue, players, timeLeft, rScore, bScore, interval, over, startTs }
+const rooms   = new Map();
+// clients: sid → { ws, sid, roomId, playerId, name, team, lastStateMs }
+const clients = new Map();
+// parties: code → { roomId }   (set when first member joins a room)
+const parties = new Map();
 
-// Permanent rooms (auto-created, never deleted)
-// Each mode has a pool of rooms. When a room fills up (50 players), a new overflow room is created.
-const roomPools = {
-  tdm: [],
-  ctf: []
-};
+let roomSeq = 0;
 
-// All active players: socketId -> { ws, roomId, playerId, name, team, data, ping, lastPing }
-const players = new Map();
-
-// Squad codes: squadCode -> [playerSocketId, ...]
-const squads = new Map();
-
-// ─────────────────────────────────────────────────────────────
-// ROOM MANAGEMENT
-// ─────────────────────────────────────────────────────────────
+// ── ROOM LIFECYCLE ────────────────────────────────────────────
 function createRoom(mode) {
-  const config = GAME_CONFIG[mode];
-  const roomId = `${mode.toUpperCase()}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-
+  const id   = `${mode.toUpperCase()}_${++roomSeq}`;
   const room = {
-    id: roomId,
-    mode,
-    players: new Map(),       // socketId -> playerData
-    redCount: 0,
-    blueCount: 0,
-    startTime: Date.now(),
-    timeLeft: config.duration,
-    timerInterval: null,
-    rScore: 0,
-    bScore: 0,
-    gameOver: false,
-    ctfFlags: {
-      red: { x: 0, y: 0, homeX: 0, homeY: 0, carriedBy: null },
-      blue: { x: 0, y: 0, homeX: 0, homeY: 0, carriedBy: null }
-    }
+    id, mode,
+    timeLeft : mode === 'ctf' ? CTF_TIME : TDM_TIME,
+    rScore: 0, bScore: 0,
+    red    : new Map(),   // sid → client ref
+    blue   : new Map(),
+    players: new Map(),   // sid → client ref (all)
+    interval: null,
+    over    : false,
+    startTs : Date.now(),
   };
-
-  // Start server-side timer
-  room.timerInterval = setInterval(() => {
-    if (room.gameOver) return;
-    room.timeLeft--;
-    
-    // Broadcast authoritative time every second to all players in room
-    broadcastToRoom(room.id, {
-      type: 'server_time',
-      t: room.timeLeft,
-      rScore: room.rScore,
-      bScore: room.bScore
-    });
-
-    if (room.timeLeft <= 0) {
-      endRoom(room);
-    }
-  }, 1000);
-
-  roomPools[mode].push(room);
-  console.log(`🏟️ Created room: ${roomId} (${mode})`);
+  rooms.set(id, room);
+  room.interval = setInterval(() => tickRoom(room), TICK_MS);
+  console.log(`🏟  Room created: ${id}`);
   return room;
 }
 
-function getOrCreateRoom(mode, squadCode) {
-  const pool = roomPools[mode];
-  
-  // If player has a squad code, try to join the same room as squad members
-  if (squadCode && squads.has(squadCode)) {
-    const squadMembers = squads.get(squadCode);
-    for (const memberId of squadMembers) {
-      const member = players.get(memberId);
-      if (member && member.roomId) {
-        const room = getRoomById(member.roomId);
-        if (room && !room.gameOver && room.players.size < MAX_PLAYERS_PER_ROOM) {
-          return room;
-        }
-      }
-    }
-  }
+function tickRoom(room) {
+  if (room.over) return;
+  room.timeLeft = Math.max(0, room.timeLeft - 1);
+  broadcastRoom(room.id, {
+    type: 'tick',
+    t : room.timeLeft,
+    rs: room.rScore,
+    bs: room.bScore
+  });
+  if (room.timeLeft <= 0) endRoom(room, null);
+}
 
-  // Find first non-full, active room
-  for (const room of pool) {
-    if (!room.gameOver && room.players.size < MAX_PLAYERS_PER_ROOM) {
-      return room;
-    }
-  }
+function endRoom(room, winner) {
+  if (room.over) return;
+  room.over = true;
+  clearInterval(room.interval);
+  broadcastRoom(room.id, {
+    type  : 'game_over',
+    winner,
+    rs    : room.rScore,
+    bs    : room.bScore
+  });
+  console.log(`🏁  Room ended: ${room.id} winner=${winner} R:${room.rScore} B:${room.bScore}`);
+  // Disassociate players, then remove room after 30 s
+  setTimeout(() => {
+    room.players.forEach((_, sid) => {
+      const c = clients.get(sid);
+      if (c) c.roomId = null;
+    });
+    rooms.delete(room.id);
+    console.log(`🗑   Room removed: ${room.id}`);
+  }, 30_000);
+}
 
-  // All rooms full — create overflow room
+function findOrCreateRoom(mode, team) {
+  for (const [, r] of rooms) {
+    if (r.mode !== mode || r.over) continue;
+    const tMap = team === 'red' ? r.red : r.blue;
+    if (tMap.size < MAX_PER_TEAM) return r;
+  }
   return createRoom(mode);
 }
 
-function getRoomById(roomId) {
-  for (const pool of Object.values(roomPools)) {
-    for (const room of pool) {
-      if (room.id === roomId) return room;
-    }
-  }
-  return null;
+function addPlayerToRoom(room, sid, client) {
+  room.players.set(sid, client);
+  (client.team === 'red' ? room.red : room.blue).set(sid, client);
+  client.roomId = room.id;
 }
 
-function endRoom(room) {
-  room.gameOver = true;
-  clearInterval(room.timerInterval);
+function removePlayerFromRoom(sid) {
+  const c = clients.get(sid);
+  if (!c || !c.roomId) return;
+  const room = rooms.get(c.roomId);
+  if (!room) { c.roomId = null; return; }
 
-  let winner = 'DRAW';
-  let winTeam = null;
-  if (room.rScore > room.bScore) { winner = 'RED TEAM WINS'; winTeam = 'red'; }
-  else if (room.bScore > room.rScore) { winner = 'BLUE TEAM WINS'; winTeam = 'blue'; }
+  room.players.delete(sid);
+  room.red.delete(sid);
+  room.blue.delete(sid);
 
-  broadcastToRoom(room.id, {
-    type: 'game_over',
-    winner,
-    winTeam,
-    rScore: room.rScore,
-    bScore: room.bScore,
-    mode: room.mode
+  broadcastRoom(room.id, {
+    type     : 'player_left',
+    playerId : c.playerId,
+    redCount : room.red.size,
+    blueCount: room.blue.size,
   });
 
-  console.log(`🏁 Room ${room.id} ended: ${winner}`);
+  c.roomId = null;
 
-  // After 15s, reset room instead of deleting it (keeps pool stable)
-  setTimeout(() => resetRoom(room), 15000);
+  if (room.players.size === 0 && !room.over) {
+    clearInterval(room.interval);
+    rooms.delete(room.id);
+    console.log(`🗑   Empty room removed: ${room.id}`);
+  }
 }
 
-function resetRoom(room) {
-  const config = GAME_CONFIG[room.mode];
-  room.timeLeft = config.duration;
-  room.rScore = 0;
-  room.bScore = 0;
-  room.gameOver = false;
-  room.startTime = Date.now();
-  room.ctfFlags = {
-    red: { x: 0, y: 0, homeX: 0, homeY: 0, carriedBy: null },
-    blue: { x: 0, y: 0, homeX: 0, homeY: 0, carriedBy: null }
-  };
+// ── BROADCAST ─────────────────────────────────────────────────
+function broadcastRoom(roomId, msg, excludeSid = null) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  const str = JSON.stringify(msg);
+  for (const [sid, c] of room.players) {
+    if (sid === excludeSid) continue;
+    if (c.ws.readyState === WebSocket.OPEN) c.ws.send(str);
+  }
+}
 
-  clearInterval(room.timerInterval);
-  room.timerInterval = setInterval(() => {
-    if (room.gameOver) return;
-    room.timeLeft--;
-    broadcastToRoom(room.id, {
-      type: 'server_time',
-      t: room.timeLeft,
-      rScore: room.rScore,
-      bScore: room.bScore
+function sendTo(ws, obj) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+// ── HTTP ROUTES ───────────────────────────────────────────────
+app.get('/', (req, res) => res.json({
+  status : 'online',
+  rooms  : rooms.size,
+  players: clients.size,
+  uptime : process.uptime(),
+  time   : new Date().toISOString(),
+}));
+
+app.get('/api/stats', (req, res) => {
+  const list = [];
+  for (const [, r] of rooms) {
+    list.push({
+      id: r.id, mode: r.mode,
+      red: r.red.size, blue: r.blue.size,
+      timeLeft: r.timeLeft, rScore: r.rScore, bScore: r.bScore,
     });
-    if (room.timeLeft <= 0) endRoom(room);
-  }, 1000);
+  }
+  res.json({ success: true, rooms: list, totalPlayers: clients.size });
+});
 
-  console.log(`🔄 Room ${room.id} reset`);
+// ── WEBSOCKET ─────────────────────────────────────────────────
+wss.on('connection', ws => {
+  const sid = Math.random().toString(36).slice(2, 12);
+  clients.set(sid, { ws, sid, roomId: null, playerId: null, name: 'PLAYER', team: 'red', lastStateMs: 0 });
 
-  // Notify existing players room restarted
-  broadcastToRoom(room.id, { type: 'room_reset', mode: room.mode });
-}
+  sendTo(ws, { type: 'connected', sid });
 
-// Initialize two permanent rooms per mode at startup
-function initPermanentRooms() {
-  createRoom('tdm');
-  createRoom('ctf');
-  console.log('🎮 Permanent rooms initialized');
-}
-
-// ─────────────────────────────────────────────────────────────
-// WEBSOCKET HANDLER
-// ─────────────────────────────────────────────────────────────
-wss.on('connection', (ws) => {
-  const socketId = Math.random().toString(36).slice(2, 11);
-  const connectedAt = Date.now();
-  
-  ws.socketId = socketId;
-  ws.pingTime = 0;
-  ws.lastPong = Date.now();
-
-  // Send pings every 2s to measure latency
-  const pingInterval = setInterval(() => {
-    if (ws.readyState !== WebSocket.OPEN) { clearInterval(pingInterval); return; }
-    ws.pingTime = Date.now();
-    ws.send(JSON.stringify({ type: 'ping_req', t: ws.pingTime }));
-  }, 2000);
-
-  ws.on('pong', () => { ws.lastPong = Date.now(); });
-
-  ws.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data);
-      handleMessage(ws, socketId, msg);
-    } catch (err) {
-      console.error('Parse error:', err.message);
-    }
+  ws.on('message', raw => {
+    try { handleMsg(ws, sid, JSON.parse(raw)); }
+    catch (e) { /* ignore malformed */ }
   });
 
   ws.on('close', () => {
-    clearInterval(pingInterval);
-    handleDisconnect(socketId);
+    removePlayerFromRoom(sid);
+    clients.delete(sid);
   });
 
-  ws.on('error', (err) => {
-    console.error('WS error:', err.message);
+  ws.on('error', () => {
+    removePlayerFromRoom(sid);
+    clients.delete(sid);
   });
-
-  ws.send(JSON.stringify({ type: 'connected', socketId }));
-  console.log(`🔌 [${socketId}] connected`);
 });
 
-function handleMessage(ws, socketId, msg) {
+// ── MESSAGE HANDLER ───────────────────────────────────────────
+function handleMsg(ws, sid, msg) {
+  const c = clients.get(sid);
+  if (!c) return;
+
   switch (msg.type) {
 
-    case 'pong_resp':
-      // Client sent pong response, calculate RTT
-      if (players.has(socketId)) {
-        const rtt = Date.now() - (msg.t || 0);
-        players.get(socketId).ping = rtt;
-        // Send ping back to client for HUD display
-        ws.send(JSON.stringify({ type: 'ping_update', ping: rtt }));
-      }
-      break;
-
-    case 'squad_create': {
-      const code = generateSquadCode();
-      squads.set(code, [socketId]);
-      ws.send(JSON.stringify({ type: 'squad_created', code }));
-      break;
-    }
-
-    case 'squad_join': {
-      const code = msg.code?.toUpperCase();
-      if (!code || !squads.has(code)) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Squad not found' }));
-        return;
-      }
-      const squad = squads.get(code);
-      if (!squad.includes(socketId)) squad.push(socketId);
-      ws.send(JSON.stringify({ type: 'squad_joined', code, members: squad.length }));
-      break;
-    }
-
-    case 'join_match': {
-      const mode = msg.mode === 'ctf' ? 'ctf' : 'tdm';
-      const room = getOrCreateRoom(mode, msg.squadCode);
-
-      // Balance team assignment: auto-assign to smaller team or respect preference
-      let team = msg.team;
-      if (team !== 'red' && team !== 'blue') team = 'red';
-      
-      // Auto-balance: if preferred team is full, switch
-      if (team === 'red' && room.redCount >= MAX_PER_TEAM) team = 'blue';
-      else if (team === 'blue' && room.blueCount >= MAX_PER_TEAM) team = 'red';
-      
-      // If both full (shouldn't happen but safety check)
-      if (room.redCount >= MAX_PER_TEAM && room.blueCount >= MAX_PER_TEAM) {
-        ws.send(JSON.stringify({ type: 'error', message: 'All rooms are full! Try again in a moment.' }));
-        return;
+    // ── MATCHMAKING ─────────────────────────────────────────
+    case 'quick_join': {
+      if (c.roomId) {
+        // Re-join after reconnect — just confirm and resend match state
+        const room = rooms.get(c.roomId);
+        if (room && !room.over) {
+          sendTo(ws, {
+            type    : 'match_joined',
+            roomId  : room.id,
+            team    : c.team,
+            timeLeft: room.timeLeft,
+            rScore  : room.rScore,
+            bScore  : room.bScore,
+            mode    : room.mode,
+            redCount : room.red.size,
+            blueCount: room.blue.size,
+          });
+          return;
+        }
+        removePlayerFromRoom(sid);
       }
 
-      // Register player
-      const playerData = {
-        ws,
-        roomId: room.id,
-        socketId,
-        playerId: msg.playerId || socketId,
-        name: (msg.name || 'PLAYER').substring(0, 14),
-        team,
-        ping: 0,
-        squadCode: msg.squadCode || null,
-        joinTime: Date.now()
-      };
-      
-      players.set(socketId, playerData);
-      room.players.set(socketId, playerData);
-      if (team === 'red') room.redCount++;
-      else room.blueCount++;
+      const { mode = 'tdm', team = 'red', name = 'PLAYER', playerId, partyCode } = msg;
+      c.playerId   = playerId || sid;
+      c.name       = (name || 'PLAYER').slice(0, 16);
+      c.team       = team === 'blue' ? 'blue' : 'red';
+      c.lastStateMs = 0;
 
-      console.log(`👋 [${playerData.name}] joined ${room.id} as ${team} (${room.players.size} players)`);
+      // Party matching
+      let room = null;
+      if (partyCode && parties.has(partyCode)) {
+        const { roomId } = parties.get(partyCode);
+        const pr = rooms.get(roomId);
+        if (pr && !pr.over) {
+          const tMap = c.team === 'red' ? pr.red : pr.blue;
+          if (tMap.size < MAX_PER_TEAM) room = pr;
+        }
+      }
+      if (!room) room = findOrCreateRoom(mode, c.team);
 
-      // Confirm join with current server state
-      ws.send(JSON.stringify({
-        type: 'match_joined',
-        roomId: room.id,
-        mode: room.mode,
-        team,                       // final team (may differ if balanced)
-        playerId: playerData.playerId,
-        timeLeft: room.timeLeft,    // ← AUTHORITATIVE server time
-        rScore: room.rScore,
-        bScore: room.bScore,
-        playerCount: room.players.size,
-        redCount: room.redCount,
-        blueCount: room.blueCount,
-        gameOver: room.gameOver
-      }));
+      // Register party if code given
+      if (partyCode) parties.set(partyCode, { roomId: room.id });
 
-      // Tell others about new player
-      broadcastToRoom(room.id, {
-        type: 'player_joined',
-        playerId: playerData.playerId,
-        name: playerData.name,
-        team
-      }, socketId);
+      addPlayerToRoom(room, sid, c);
 
-      // Update player counts to everyone
-      broadcastRoomInfo(room);
-      break;
-    }
-
-    case 'state':
-      relayToRoom(socketId, msg);
-      break;
-
-    case 'bullet':
-      relayToRoom(socketId, msg);
-      break;
-
-    case 'hit':
-      relayToRoom(socketId, msg);
-      break;
-
-    case 'kill': {
-      const player = players.get(socketId);
-      if (!player) break;
-      const room = getRoomById(player.roomId);
-      if (!room || room.gameOver) break;
-
-      const config = GAME_CONFIG[room.mode];
-      if (msg.team === 'red') room.rScore = Math.min(room.rScore + 1, config.winScore + 100);
-      else room.bScore = Math.min(room.bScore + 1, config.winScore + 100);
-
-      // Broadcast kill event + updated score
-      broadcastToRoom(room.id, {
-        type: 'kill',
-        kname: msg.kname,
-        vname: msg.vname,
-        team: msg.team,
-        rScore: room.rScore,
-        bScore: room.bScore
+      sendTo(ws, {
+        type    : 'match_joined',
+        roomId  : room.id,
+        team    : c.team,
+        timeLeft: room.timeLeft,
+        rScore  : room.rScore,
+        bScore  : room.bScore,
+        mode    : room.mode,
+        redCount : room.red.size,
+        blueCount: room.blue.size,
       });
 
-      // Check win condition
-      if (room.rScore >= config.winScore || room.bScore >= config.winScore) {
-        endRoom(room);
-      }
+      broadcastRoom(room.id, {
+        type     : 'player_joined',
+        playerId : c.playerId,
+        name     : c.name,
+        team     : c.team,
+        redCount : room.red.size,
+        blueCount: room.blue.size,
+      }, sid);
+
+      console.log(`✅ ${c.name} [${c.team}] → ${room.id}  R:${room.red.size} B:${room.blue.size}`);
+      break;
+    }
+
+    // ── PARTY ───────────────────────────────────────────────
+    case 'create_party': {
+      const code = Math.random().toString(36).slice(2, 8).toUpperCase();
+      // Register without a room yet; room is assigned on quick_join
+      parties.set(code, { roomId: c.roomId || null });
+      sendTo(ws, { type: 'party_created', code });
+      break;
+    }
+
+    // ── LATENCY PROBE ───────────────────────────────────────
+    case 'ping': {
+      sendTo(ws, { type: 'pong', ct: msg.ct });
+      break;
+    }
+
+    // ── SCORE AUTHORITY ─────────────────────────────────────
+    case 'kill': {
+      if (!c.roomId) break;
+      const room = rooms.get(c.roomId);
+      if (!room || room.over) break;
+      if (msg.team === 'red') room.rScore++;
+      else room.bScore++;
+      // Broadcast the kill + authoritative scores to EVERYONE (including killer)
+      broadcastRoom(room.id, {
+        type  : 'kill',
+        kname : msg.kname,
+        vname : msg.vname,
+        team  : msg.team,
+        rs    : room.rScore,
+        bs    : room.bScore,
+      });
+      const winScore = room.mode === 'ctf' ? CTF_WIN_SCORE : TDM_WIN_SCORE;
+      if (room.rScore >= winScore) endRoom(room, 'red');
+      else if (room.bScore >= winScore) endRoom(room, 'blue');
       break;
     }
 
     case 'ctf_score': {
-      const player = players.get(socketId);
-      if (!player) break;
-      const room = getRoomById(player.roomId);
-      if (!room || room.gameOver) break;
-
+      if (!c.roomId) break;
+      const room = rooms.get(c.roomId);
+      if (!room || room.over) break;
       if (msg.team === 'red') room.rScore++;
       else room.bScore++;
-
-      broadcastToRoom(room.id, {
-        type: 'ctf_score',
-        team: msg.team,
-        flagTeam: msg.flagTeam,
-        name: msg.name,
-        pid: msg.pid,
-        rScore: room.rScore,
-        bScore: room.bScore
+      broadcastRoom(room.id, {
+        ...msg,
+        rs: room.rScore,
+        bs: room.bScore,
       });
-
-      if (room.rScore >= GAME_CONFIG.ctf.winScore || room.bScore >= GAME_CONFIG.ctf.winScore) {
-        endRoom(room);
-      }
+      if (room.rScore >= CTF_WIN_SCORE) endRoom(room, 'red');
+      else if (room.bScore >= CTF_WIN_SCORE) endRoom(room, 'blue');
       break;
     }
 
+    // ── STATE — throttled relay ─────────────────────────────
+    case 'state': {
+      if (!c.roomId) break;
+      const now = Date.now();
+      if (now - c.lastStateMs < STATE_THROTTLE) break;  // drop if too frequent
+      c.lastStateMs = now;
+      broadcastRoom(c.roomId, msg, sid);
+      break;
+    }
+
+    // ── LEAVE ───────────────────────────────────────────────
     case 'leave':
-      handleDisconnect(socketId);
+    case 'bye': {
+      removePlayerFromRoom(sid);
       break;
-
-    // Relay everything else
-    default:
-      relayToRoom(socketId, msg);
-      break;
-  }
-}
-
-function handleDisconnect(socketId) {
-  const player = players.get(socketId);
-  if (!player) return;
-
-  const room = getRoomById(player.roomId);
-  if (room) {
-    room.players.delete(socketId);
-    if (player.team === 'red') room.redCount = Math.max(0, room.redCount - 1);
-    else room.blueCount = Math.max(0, room.blueCount - 1);
-
-    broadcastToRoom(room.id, {
-      type: 'player_left',
-      playerId: player.playerId
-    });
-
-    broadcastRoomInfo(room);
-  }
-
-  // Remove from squad
-  if (player.squadCode && squads.has(player.squadCode)) {
-    const squad = squads.get(player.squadCode);
-    const idx = squad.indexOf(socketId);
-    if (idx > -1) squad.splice(idx, 1);
-    if (squad.length === 0) squads.delete(player.squadCode);
-  }
-
-  players.delete(socketId);
-  console.log(`🔌 [${player.name}] disconnected`);
-}
-
-function broadcastToRoom(roomId, msg, excludeSocketId = null) {
-  const room = getRoomById(roomId);
-  if (!room) return;
-  const msgStr = JSON.stringify(msg);
-  room.players.forEach((player, sid) => {
-    if (sid === excludeSocketId) return;
-    const ws = player.ws;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(msgStr);
     }
-  });
-}
 
-function broadcastRoomInfo(room) {
-  broadcastToRoom(room.id, {
-    type: 'room_info',
-    playerCount: room.players.size,
-    redCount: room.redCount,
-    blueCount: room.blueCount
-  });
-}
-
-function relayToRoom(socketId, msg) {
-  const player = players.get(socketId);
-  if (!player) return;
-  broadcastToRoom(player.roomId, msg, socketId);
-}
-
-function generateSquadCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
-  if (squads.has(code)) return generateSquadCode();
-  return code;
-}
-
-// ─────────────────────────────────────────────────────────────
-// HTTP ROUTES
-// ─────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  const roomInfo = {};
-  for (const [mode, pool] of Object.entries(roomPools)) {
-    roomInfo[mode] = pool.map(r => ({
-      id: r.id,
-      players: r.players.size,
-      red: r.redCount,
-      blue: r.blueCount,
-      timeLeft: r.timeLeft,
-      gameOver: r.gameOver
-    }));
+    // ── RELAY EVERYTHING ELSE ───────────────────────────────
+    default: {
+      if (c.roomId) broadcastRoom(c.roomId, msg, sid);
+      break;
+    }
   }
-  res.json({ status: 'online', totalPlayers: players.size, rooms: roomInfo, timestamp: new Date().toISOString() });
-});
+}
 
-app.get('/api/rooms', (req, res) => {
-  const result = {};
-  for (const [mode, pool] of Object.entries(roomPools)) {
-    result[mode] = pool.map(r => ({
-      id: r.id, players: r.players.size, maxPlayers: MAX_PLAYERS_PER_ROOM,
-      red: r.redCount, blue: r.blueCount, timeLeft: r.timeLeft, gameOver: r.gameOver
-    }));
-  }
-  res.json({ success: true, rooms: result, totalPlayers: players.size });
-});
-
-app.get('/api/stats', (req, res) => {
-  res.json({
-    success: true,
-    stats: { activePlayers: players.size, activeSquads: squads.size, uptime: process.uptime(), serverTime: new Date().toISOString() }
-  });
-});
-
-// ─────────────────────────────────────────────────────────────
-// START — bind to 0.0.0.0 so Railway can reach it, init rooms after bind
-// ─────────────────────────────────────────────────────────────
-server.listen(PORT, '0.0.0.0', () => {
+// ── START ─────────────────────────────────────────────────────
+server.listen(PORT, () => {
   console.log(`
-╔══════════════════════════════════════════════╗
-║   LUNAFYRE SERVER v3.0 ONLINE                ║
-║                                              ║
-║   Port: ${PORT}                                 ║
-║   Modes: TDM (300pts/20min) | CTF (10pts/18min) ║
-║   Per room: 50 players max (25 per team)     ║
-║   Time sync: SERVER-AUTHORITATIVE            ║
-╚══════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════╗
+║     LUNAFYRE SERVER v3.0 — MATCHMAKING EDITION    ║
+║                                                   ║
+║  Port  : ${PORT}                                   ║
+║  TDM   : ${TDM_WIN_SCORE} kills  /  20 min                  ║
+║  CTF   : ${CTF_WIN_SCORE}  caps  /  18 min                  ║
+║  Teams : ${MAX_PER_TEAM} red + ${MAX_PER_TEAM} blue per room              ║
+╚═══════════════════════════════════════════════════╝
   `);
-  // Init rooms AFTER server is bound — Railway health check passes first
-  initPermanentRooms();
 });
 
 process.on('SIGTERM', () => {
-  console.log('Shutting down...');
   wss.clients.forEach(c => c.close());
   server.close(() => process.exit(0));
 });
