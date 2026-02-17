@@ -24,7 +24,7 @@ const CTF_TIME       = 1080;   // 18 min in seconds
 const TDM_WIN_SCORE  = 300;
 const CTF_WIN_SCORE  = 10;
 const TICK_MS        = 1000;   // server timer tick
-const STATE_THROTTLE = 40;     // ms between state relays per player (anti-flood)
+const STATE_THROTTLE = 50;     // ms between state relays per player (anti-flood)
 
 // ── DATA ──────────────────────────────────────────────────────
 // rooms: id → { id, mode, red, blue, players, timeLeft, rScore, bScore, interval, over, startTs }
@@ -330,9 +330,11 @@ function handleMsg(ws, sid, msg) {
       break;
     }
 
-    // ── HELICOPTER STATE — unthrottled relay (critical for visibility) ──
+    // ── VEHICLE STATE — relay tank and helicopter states ────
+    case 'tank_state':
     case 'heli_state': {
       if (!c.roomId) break;
+      // No throttling for vehicle states - they need real-time updates
       broadcastRoom(c.roomId, msg, sid);
       break;
     }
