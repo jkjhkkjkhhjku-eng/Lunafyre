@@ -1,11 +1,12 @@
 // ============================================================
-//  LUNAFYRE SERVER v3.0 — MATCHMAKING EDITION
-//  Server-authoritative timer, scores, auto-room, party system
+//  LUNAFYRE SERVER v4.0 — LEADERBOARD EDITION
+//  Server-authoritative timer, scores, leaderboard,
+//  kill-streaks, kill-sound events, party system
 // ============================================================
 
-const express = require('express');
-const cors    = require('cors');
-const http    = require('http');
+const express   = require('express');
+const cors      = require('cors');
+const http      = require('http');
 const WebSocket = require('ws');
 
 const app  = express();
@@ -14,27 +15,68 @@ app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-// perMessageDeflate: false — lower CPU, lower latency for small frames
+// perMessageDeflate:false — lower CPU, lower latency for small frames
 const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 
 // ── CONSTANTS ─────────────────────────────────────────────────
 const MAX_PER_TEAM   = 25;
-const TDM_TIME       = 1200;   // 20 min in seconds
-const CTF_TIME       = 1080;   // 18 min in seconds
+const TDM_TIME       = 1200;   // 20 min
+const CTF_TIME       = 1080;   // 18 min
 const TDM_WIN_SCORE  = 300;
 const CTF_WIN_SCORE  = 10;
-const TICK_MS        = 1000;   // server timer tick
-const STATE_THROTTLE = 50;     // ms between state relays per player (anti-flood)
+const TICK_MS        = 1000;
+const STATE_THROTTLE = 33;     // ms — matches client 30Hz send rate
+
+// Kill streak thresholds → announcement labels
+const STREAK_LABELS = {
+  2 : 'DOUBLE KILL',
+  3 : 'TRIPLE KILL',
+  4 : 'QUAD KILL',
+  5 : 'PENTA KILL',
+  7 : 'RAMPAGE',
+  10: 'GODLIKE',
+};
+const STREAK_RESET_MS = 4500; // reset streak if no kill within this window
 
 // ── DATA ──────────────────────────────────────────────────────
-// rooms: id → { id, mode, red, blue, players, timeLeft, rScore, bScore, interval, over, startTs }
+// rooms:   id → { id, mode, red, blue, players, timeLeft, rScore, bScore,
+//                 interval, over, startTs, leaderboard }
 const rooms   = new Map();
-// clients: sid → { ws, sid, roomId, playerId, name, team, lastStateMs }
+// clients: sid → { ws, sid, roomId, playerId, name, team, lastStateMs,
+//                  kills, deaths, captures, streak, lastKillMs }
 const clients = new Map();
-// parties: code → { roomId }   (set when first member joins a room)
+// parties: code → { roomId }
 const parties = new Map();
 
 let roomSeq = 0;
+
+// ── LEADERBOARD HELPERS ───────────────────────────────────────
+function buildLeaderboard(room) {
+  // Returns sorted array of player stats for this room
+  const rows = [];
+  for (const [, c] of room.players) {
+    rows.push({
+      id      : c.playerId,
+      name    : c.name,
+      team    : c.team,
+      kills   : c.kills    || 0,
+      deaths  : c.deaths   || 0,
+      captures: c.captures || 0,
+    });
+  }
+  // Sort: kills desc, then deaths asc
+  rows.sort((a, b) => b.kills - a.kills || a.deaths - b.deaths);
+  return rows;
+}
+
+function broadcastLeaderboard(room) {
+  broadcastRoom(room.id, {
+    type       : 'leaderboard',
+    rows       : buildLeaderboard(room),
+    rScore     : room.rScore,
+    bScore     : room.bScore,
+  });
+}
 
 // ── ROOM LIFECYCLE ────────────────────────────────────────────
 function createRoom(mode) {
@@ -43,9 +85,9 @@ function createRoom(mode) {
     id, mode,
     timeLeft : mode === 'ctf' ? CTF_TIME : TDM_TIME,
     rScore: 0, bScore: 0,
-    red    : new Map(),   // sid → client ref
+    red    : new Map(),
     blue   : new Map(),
-    players: new Map(),   // sid → client ref (all)
+    players: new Map(),
     interval: null,
     over    : false,
     startTs : Date.now(),
@@ -63,7 +105,7 @@ function tickRoom(room) {
     type: 'tick',
     t : room.timeLeft,
     rs: room.rScore,
-    bs: room.bScore
+    bs: room.bScore,
   });
   if (room.timeLeft <= 0) endRoom(room, null);
 }
@@ -72,14 +114,19 @@ function endRoom(room, winner) {
   if (room.over) return;
   room.over = true;
   clearInterval(room.interval);
+
+  // Build final leaderboard sorted by kills
+  const finalBoard = buildLeaderboard(room);
+
   broadcastRoom(room.id, {
-    type  : 'game_over',
+    type      : 'game_over',
     winner,
-    rs    : room.rScore,
-    bs    : room.bScore
+    rs        : room.rScore,
+    bs        : room.bScore,
+    leaderboard: finalBoard,      // full end-of-game board
   });
   console.log(`🏁  Room ended: ${room.id} winner=${winner} R:${room.rScore} B:${room.bScore}`);
-  // Disassociate players, then remove room after 30 s
+
   setTimeout(() => {
     room.players.forEach((_, sid) => {
       const c = clients.get(sid);
@@ -121,6 +168,9 @@ function removePlayerFromRoom(sid) {
     redCount : room.red.size,
     blueCount: room.blue.size,
   });
+
+  // Update leaderboard for remaining players
+  if (!room.over && room.players.size > 0) broadcastLeaderboard(room);
 
   c.roomId = null;
 
@@ -170,7 +220,13 @@ app.get('/api/stats', (req, res) => {
 // ── WEBSOCKET ─────────────────────────────────────────────────
 wss.on('connection', ws => {
   const sid = Math.random().toString(36).slice(2, 12);
-  clients.set(sid, { ws, sid, roomId: null, playerId: null, name: 'PLAYER', team: 'red', lastStateMs: 0 });
+  clients.set(sid, {
+    ws, sid, roomId: null, playerId: null,
+    name: 'PLAYER', team: 'red',
+    lastStateMs: 0,
+    kills: 0, deaths: 0, captures: 0,
+    streak: 0, lastKillMs: 0,
+  });
 
   sendTo(ws, { type: 'connected', sid });
 
@@ -179,15 +235,8 @@ wss.on('connection', ws => {
     catch (e) { /* ignore malformed */ }
   });
 
-  ws.on('close', () => {
-    removePlayerFromRoom(sid);
-    clients.delete(sid);
-  });
-
-  ws.on('error', () => {
-    removePlayerFromRoom(sid);
-    clients.delete(sid);
-  });
+  ws.on('close', () => { removePlayerFromRoom(sid); clients.delete(sid); });
+  ws.on('error', () => { removePlayerFromRoom(sid); clients.delete(sid); });
 });
 
 // ── MESSAGE HANDLER ───────────────────────────────────────────
@@ -200,19 +249,19 @@ function handleMsg(ws, sid, msg) {
     // ── MATCHMAKING ─────────────────────────────────────────
     case 'quick_join': {
       if (c.roomId) {
-        // Re-join after reconnect — just confirm and resend match state
         const room = rooms.get(c.roomId);
         if (room && !room.over) {
           sendTo(ws, {
-            type    : 'match_joined',
-            roomId  : room.id,
-            team    : c.team,
-            timeLeft: room.timeLeft,
-            rScore  : room.rScore,
-            bScore  : room.bScore,
-            mode    : room.mode,
-            redCount : room.red.size,
-            blueCount: room.blue.size,
+            type      : 'match_joined',
+            roomId    : room.id,
+            team      : c.team,
+            timeLeft  : room.timeLeft,
+            rScore    : room.rScore,
+            bScore    : room.bScore,
+            mode      : room.mode,
+            redCount  : room.red.size,
+            blueCount : room.blue.size,
+            leaderboard: buildLeaderboard(room),  // ← late-join gets full board
           });
           return;
         }
@@ -220,12 +269,14 @@ function handleMsg(ws, sid, msg) {
       }
 
       const { mode = 'tdm', team = 'red', name = 'PLAYER', playerId, partyCode } = msg;
-      c.playerId   = playerId || sid;
-      c.name       = (name || 'PLAYER').slice(0, 16);
-      c.team       = team === 'blue' ? 'blue' : 'red';
+      c.playerId    = playerId || sid;
+      c.name        = (name || 'PLAYER').slice(0, 16);
+      c.team        = team === 'blue' ? 'blue' : 'red';
       c.lastStateMs = 0;
+      // Reset per-match stats on fresh join
+      c.kills = 0; c.deaths = 0; c.captures = 0;
+      c.streak = 0; c.lastKillMs = 0;
 
-      // Party matching
       let room = null;
       if (partyCode && parties.has(partyCode)) {
         const { roomId } = parties.get(partyCode);
@@ -236,22 +287,21 @@ function handleMsg(ws, sid, msg) {
         }
       }
       if (!room) room = findOrCreateRoom(mode, c.team);
-
-      // Register party if code given
       if (partyCode) parties.set(partyCode, { roomId: room.id });
 
       addPlayerToRoom(room, sid, c);
 
       sendTo(ws, {
-        type    : 'match_joined',
-        roomId  : room.id,
-        team    : c.team,
-        timeLeft: room.timeLeft,
-        rScore  : room.rScore,
-        bScore  : room.bScore,
-        mode    : room.mode,
-        redCount : room.red.size,
-        blueCount: room.blue.size,
+        type       : 'match_joined',
+        roomId     : room.id,
+        team       : c.team,
+        timeLeft   : room.timeLeft,
+        rScore     : room.rScore,
+        bScore     : room.bScore,
+        mode       : room.mode,
+        redCount   : room.red.size,
+        blueCount  : room.blue.size,
+        leaderboard: buildLeaderboard(room),   // ← always send board on join
       });
 
       broadcastRoom(room.id, {
@@ -270,7 +320,6 @@ function handleMsg(ws, sid, msg) {
     // ── PARTY ───────────────────────────────────────────────
     case 'create_party': {
       const code = Math.random().toString(36).slice(2, 8).toUpperCase();
-      // Register without a room yet; room is assigned on quick_join
       parties.set(code, { roomId: c.roomId || null });
       sendTo(ws, { type: 'party_created', code });
       break;
@@ -282,41 +331,85 @@ function handleMsg(ws, sid, msg) {
       break;
     }
 
-    // ── SCORE AUTHORITY ─────────────────────────────────────
+    // ── KILL ────────────────────────────────────────────────
     case 'kill': {
       if (!c.roomId) break;
       const room = rooms.get(c.roomId);
       if (!room || room.over) break;
+
+      // Score
       if (msg.team === 'red') room.rScore++;
       else room.bScore++;
-      // Broadcast the kill + authoritative scores to EVERYONE (including killer)
+
+      // Track killer stats + streak
+      c.kills++;
+      const now = Date.now();
+      if (now - c.lastKillMs < STREAK_RESET_MS) {
+        c.streak++;
+      } else {
+        c.streak = 1;
+      }
+      c.lastKillMs = now;
+
+      // Track victim deaths
+      const victim = [...room.players.values()].find(p => p.playerId === msg.vid);
+      if (victim) { victim.deaths++; victim.streak = 0; }
+
+      const streakLabel = STREAK_LABELS[c.streak] || null;
+
+      // Broadcast kill event + updated scores + streak announcement
       broadcastRoom(room.id, {
-        type  : 'kill',
-        kname : msg.kname,
-        vname : msg.vname,
-        team  : msg.team,
-        rs    : room.rScore,
-        bs    : room.bScore,
+        type       : 'kill',
+        kname      : msg.kname,
+        vname      : msg.vname,
+        kid        : c.playerId,
+        vid        : msg.vid,
+        team       : msg.team,
+        rs         : room.rScore,
+        bs         : room.bScore,
+        streak     : c.streak,
+        streakLabel,           // null if not a notable streak
       });
+
+      // Push updated leaderboard to everyone
+      broadcastLeaderboard(room);
+
       const winScore = room.mode === 'ctf' ? CTF_WIN_SCORE : TDM_WIN_SCORE;
       if (room.rScore >= winScore) endRoom(room, 'red');
       else if (room.bScore >= winScore) endRoom(room, 'blue');
       break;
     }
 
+    // ── CTF SCORE ───────────────────────────────────────────
     case 'ctf_score': {
       if (!c.roomId) break;
       const room = rooms.get(c.roomId);
       if (!room || room.over) break;
+
       if (msg.team === 'red') room.rScore++;
       else room.bScore++;
+      c.captures = (c.captures || 0) + 1;
+
       broadcastRoom(room.id, {
         ...msg,
         rs: room.rScore,
         bs: room.bScore,
       });
+
+      broadcastLeaderboard(room);
+
       if (room.rScore >= CTF_WIN_SCORE) endRoom(room, 'red');
       else if (room.bScore >= CTF_WIN_SCORE) endRoom(room, 'blue');
+      break;
+    }
+
+    // ── PLAYER DIED (client reports own death for leaderboard) ─
+    case 'player_died': {
+      if (!c.roomId) break;
+      c.deaths = (c.deaths || 0) + 1;
+      c.streak = 0;
+      const room = rooms.get(c.roomId);
+      if (room && !room.over) broadcastLeaderboard(room);
       break;
     }
 
@@ -324,17 +417,8 @@ function handleMsg(ws, sid, msg) {
     case 'state': {
       if (!c.roomId) break;
       const now = Date.now();
-      if (now - c.lastStateMs < STATE_THROTTLE) break;  // drop if too frequent
+      if (now - c.lastStateMs < STATE_THROTTLE) break;
       c.lastStateMs = now;
-      broadcastRoom(c.roomId, msg, sid);
-      break;
-    }
-
-    // ── VEHICLE STATE — relay tank and helicopter states ────
-    case 'tank_state':
-    case 'heli_state': {
-      if (!c.roomId) break;
-      // No throttling for vehicle states - they need real-time updates
       broadcastRoom(c.roomId, msg, sid);
       break;
     }
@@ -358,7 +442,7 @@ function handleMsg(ws, sid, msg) {
 server.listen(PORT, () => {
   console.log(`
 ╔═══════════════════════════════════════════════════╗
-║     LUNAFYRE SERVER v3.0 — MATCHMAKING EDITION    ║
+║    LUNAFYRE SERVER v4.0 — LEADERBOARD EDITION     ║
 ║                                                   ║
 ║  Port  : ${PORT}                                   ║
 ║  TDM   : ${TDM_WIN_SCORE} kills  /  20 min                  ║
