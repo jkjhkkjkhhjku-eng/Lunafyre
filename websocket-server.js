@@ -36,7 +36,7 @@ const MAX_KILL_RATE = 15;          // kills per 10s
 const MAX_DAMAGE_PER_HIT = 200;
 const MAX_SPEED = 5;               // tiles/frame
 const MAX_BULLETS_PER_SEC = 20;
-const CHEAT_BAN_THRESHOLD = 5;
+const CHEAT_BAN_THRESHOLD = 12;
 
 // ── DATA ──────────────────────────────────────────────────────
 const rooms   = new Map();
@@ -81,8 +81,9 @@ function checkSpeed(p, x, y) {
     p.lastPosition = { x, y }; p.lastPosTime = now; return true;
   }
   const dt = now - p.lastPosTime;
-  // Ignore frames too close together — tiny dt magnifies noise
-  if (dt < 16) return true;
+  // Ignore frames too close together — tiny dt magnifies noise.
+  // Still update lastPosition so accumulated distance doesn't cause false flags later.
+  if (dt < 16) { p.lastPosition = { x, y }; p.lastPosTime = now; return true; }
   const dx = x - p.lastPosition.x, dy = y - p.lastPosition.y;
   const dist = Math.sqrt(dx * dx + dy * dy);
   const speed = dist / (dt / 16);   // pixels-per-frame at 60 fps baseline
