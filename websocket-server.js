@@ -332,6 +332,13 @@ function handleMsg(ws, sid, msg) {
       }
       break;
     }
+    case 'emoji': {
+      if (!c.roomId) break;
+      const ALLOWED_EMOJIS = ['😂','😢','💀','❤️'];
+      if (!ALLOWED_EMOJIS.includes(msg.emoji)) break;
+      broadcastRoom(c.roomId, { type: 'emoji', id: c.playerId, emoji: msg.emoji }, sid);
+      break;
+    }
     default: {
       if (c.roomId) broadcastRoom(c.roomId, msg, sid);
       break;
