@@ -354,12 +354,18 @@ function handleMsg(ws, sid, msg) {
       const now = Date.now();
       if (now - c.lastStateMs < STATE_THROTTLE) break;
       c.lastStateMs = now;
-      if (msg.x !== undefined && msg.y !== undefined) {
+      // Skip speed check if this is a teleport event (tank entry/exit, respawn)
+      if (msg.x !== undefined && msg.y !== undefined && !msg.teleport) {
         if (!checkSpeed(c.security, msg.x, msg.y)) {
           if (c.security.violations < 3) break;
           kickCheater(ws, sid, 'Speed hack detected');
           break;
         }
+      }
+      // Reset speed tracking on teleport to avoid false positive on next frame
+      if (msg.teleport) {
+        c.security.lastPosition = { x: msg.x, y: msg.y };
+        c.security.lastPosTime = now;
       }
       broadcastRoom(c.roomId, msg, sid);
       break;
