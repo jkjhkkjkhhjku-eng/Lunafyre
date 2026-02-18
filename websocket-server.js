@@ -1,6 +1,5 @@
 // ============================================================
-//  LUNAFYRE SERVER v4.1 — SECURE EDITION
-//  Server-authoritative validation, anti-cheat, rate limiting
+//  LUNAFYRE SERVER v4.1
 // ============================================================
 
 const express   = require('express');
@@ -31,12 +30,6 @@ const STREAK_LABELS = {
 };
 const STREAK_RESET_MS = 4500;
 
-// ── SECURITY CONSTANTS ────────────────────────────────────────
-const MAX_KILL_RATE = 15;          // kills per 10s
-const MAX_DAMAGE_PER_HIT = 200;
-const MAX_SPEED = 5;               // tiles/frame
-const MAX_BULLETS_PER_SEC = 20;
-const CHEAT_BAN_THRESHOLD = 12;
 
 // ── DATA ──────────────────────────────────────────────────────
 const rooms   = new Map();
@@ -44,67 +37,6 @@ const clients = new Map();
 const parties = new Map();
 let roomSeq = 0;
 
-// ── SECURITY ──────────────────────────────────────────────────
-function createSecurityProfile() {
-  return {
-    killTimestamps: [], bulletTimestamps: [],
-    lastPosition: null, lastPosTime: 0,
-    violations: 0, banned: false,
-    teleportGraceUntil: 0,
-  };
-}
-
-function checkKillRate(p) {
-  const now = Date.now();
-  p.killTimestamps = p.killTimestamps.filter(t => now - t < 10000);
-  if (p.killTimestamps.length >= MAX_KILL_RATE) { p.violations++; return false; }
-  p.killTimestamps.push(now);
-  return true;
-}
-
-function checkBulletRate(p) {
-  const now = Date.now();
-  p.bulletTimestamps = p.bulletTimestamps.filter(t => now - t < 1000);
-  if (p.bulletTimestamps.length >= MAX_BULLETS_PER_SEC) { p.violations++; return false; }
-  p.bulletTimestamps.push(now);
-  return true;
-}
-
-function checkSpeed(p, x, y) {
-  const now = Date.now();
-  // Always initialise on first call
-  if (!p.lastPosition || !p.lastPosTime) {
-    p.lastPosition = { x, y }; p.lastPosTime = now; return true;
-  }
-  // Skip check during grace period after a teleport (tank enter/exit, respawn)
-  if (p.teleportGraceUntil && now < p.teleportGraceUntil) {
-    p.lastPosition = { x, y }; p.lastPosTime = now; return true;
-  }
-  const dt = now - p.lastPosTime;
-  // Ignore frames too close together — tiny dt magnifies noise.
-  // Still update lastPosition so accumulated distance doesn't cause false flags later.
-  if (dt < 16) { p.lastPosition = { x, y }; p.lastPosTime = now; return true; }
-  const dx = x - p.lastPosition.x, dy = y - p.lastPosition.y;
-  const dist = Math.sqrt(dx * dx + dy * dy);
-  const speed = dist / (dt / 16);   // pixels-per-frame at 60 fps baseline
-  p.lastPosition = { x, y }; p.lastPosTime = now;
-  if (speed > MAX_SPEED) { p.violations++; return false; }
-  return true;
-}
-
-function checkDamage(dmg) {
-  return dmg <= MAX_DAMAGE_PER_HIT;
-}
-
-function kickCheater(ws, sid, reason) {
-  const c = clients.get(sid);
-  if (!c) return;
-  console.log(`🚫 KICKED: ${c.name} — ${reason}`);
-  sendTo(ws, { type: 'kicked', reason });
-  ws.close();
-  removePlayerFromRoom(sid);
-  clients.delete(sid);
-}
 
 // ── LEADERBOARD ───────────────────────────────────────────────
 function buildLeaderboard(room) {
@@ -236,7 +168,7 @@ wss.on('connection', ws => {
   clients.set(sid, {
     ws, sid, roomId: null, playerId: null, name: 'PLAYER', team: 'red',
     lastStateMs: 0, kills: 0, deaths: 0, captures: 0,
-    streak: 0, lastKillMs: 0, security: createSecurityProfile(),
+    streak: 0, lastKillMs: 0,
   });
   sendTo(ws, { type: 'connected', sid });
   ws.on('message', raw => { try { handleMsg(ws, sid, JSON.parse(raw)); } catch (e) {} });
@@ -248,12 +180,6 @@ wss.on('connection', ws => {
 function handleMsg(ws, sid, msg) {
   const c = clients.get(sid);
   if (!c) return;
-  if (c.security.banned) { ws.close(); return; }
-  if (c.security.violations >= CHEAT_BAN_THRESHOLD) {
-    c.security.banned = true;
-    kickCheater(ws, sid, 'Multiple cheat detections');
-    return;
-  }
 
   switch (msg.type) {
     case 'quick_join': {
@@ -315,10 +241,6 @@ function handleMsg(ws, sid, msg) {
       if (!c.roomId) break;
       const room = rooms.get(c.roomId);
       if (!room || room.over) break;
-      if (!checkKillRate(c.security)) {
-        kickCheater(ws, sid, 'Abnormal kill rate');
-        break;
-      }
       if (msg.team === 'red') room.rScore++; else room.bScore++;
       c.kills++;
       const now = Date.now();
@@ -362,42 +284,16 @@ function handleMsg(ws, sid, msg) {
       const now = Date.now();
       if (now - c.lastStateMs < STATE_THROTTLE) break;
       c.lastStateMs = now;
-      // Skip speed check if this is a teleport event (tank entry/exit, respawn)
-      if (msg.x !== undefined && msg.y !== undefined && !msg.teleport) {
-        if (!checkSpeed(c.security, msg.x, msg.y)) {
-          if (c.security.violations < 3) break;
-          kickCheater(ws, sid, 'Speed hack detected');
-          break;
-        }
-      }
-      // Reset speed tracking on teleport + apply 300ms grace window for the next frames
-      if (msg.teleport) {
-        c.security.lastPosition = { x: msg.x, y: msg.y };
-        c.security.lastPosTime = Date.now();
-        c.security.teleportGraceUntil = Date.now() + 300; // 300ms grace after teleport
-      }
       broadcastRoom(c.roomId, msg, sid);
       break;
     }
     case 'bullet': {
       if (!c.roomId) break;
-      if (!checkBulletRate(c.security)) {
-        kickCheater(ws, sid, 'Rapid fire detected');
-        break;
-      }
-      if (msg.dmg && !checkDamage(msg.dmg)) {
-        kickCheater(ws, sid, 'Invalid damage value');
-        break;
-      }
       broadcastRoom(c.roomId, msg, sid);
       break;
     }
     case 'hit': {
       if (!c.roomId) break;
-      if (msg.dmg && !checkDamage(msg.dmg)) {
-        c.security.violations++;
-        break;
-      }
       broadcastRoom(c.roomId, msg, sid);
       break;
     }
@@ -447,10 +343,8 @@ function handleMsg(ws, sid, msg) {
 server.listen(PORT, () => {
   console.log(`
 ╔═══════════════════════════════════════════════════╗
-║    LUNAFYRE SERVER v4.2 — SECURE EDITION          ║
-║  Port      : ${PORT.toString().padEnd(4)} │ Anti-Cheat: ENABLED       ║
-║  Max Speed : ${MAX_SPEED} t/f │ Max Damage: ${MAX_DAMAGE_PER_HIT}            ║
-║  State Hz  : 120hz│ Teleport Grace: 300ms        ║
+║    LUNAFYRE SERVER v4.2                           ║
+║  Port      : ${PORT.toString().padEnd(4)} │ State Hz  : 120hz         ║
 ╚═══════════════════════════════════════════════════╝
   `);
 });
