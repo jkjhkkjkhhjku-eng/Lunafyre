@@ -405,6 +405,36 @@ function handleMsg(ws, sid, msg) {
       removePlayerFromRoom(sid);
       break;
     }
+    case 'chat': {
+      if (!c.roomId) break;
+      const room = rooms.get(c.roomId);
+      if (!room || room.over) break;
+      // Sanitise
+      const chatText = (msg.text || '').slice(0, 120).trim();
+      if (!chatText) break;
+      const scope = msg.scope === 'team' ? 'team' : 'all';
+      const chatPayload = {
+        type: 'chat',
+        id: c.playerId,
+        name: c.name,
+        team: c.team,
+        scope,
+        text: chatText,
+      };
+      if (scope === 'team') {
+        // Send only to same-team players
+        const teamMap = c.team === 'red' ? room.red : room.blue;
+        const str = JSON.stringify(chatPayload);
+        for (const [tsid, tc] of teamMap) {
+          if (tsid === sid) continue; // sender already has their own message
+          if (tc.ws.readyState === WebSocket.OPEN) tc.ws.send(str);
+        }
+      } else {
+        // Broadcast to whole room, excluding sender (they already showed locally)
+        broadcastRoom(c.roomId, chatPayload, sid);
+      }
+      break;
+    }
     default: {
       if (c.roomId) broadcastRoom(c.roomId, msg, sid);
       break;
