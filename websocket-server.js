@@ -183,9 +183,12 @@ function handleMsg(ws, sid, msg) {
 
   switch (msg.type) {
     case 'quick_join': {
+      const { mode = 'tdm', team = 'red', name = 'PLAYER', playerId, partyCode } = msg;
+      // BUG FIX: Check if player is in a room AND if that room matches the requested mode
       if (c.roomId) {
         const room = rooms.get(c.roomId);
-        if (room && !room.over) {
+        if (room && !room.over && room.mode === mode) {
+          // Only rejoin if mode matches!
           sendTo(ws, {
             type: 'match_joined', roomId: room.id, team: c.team,
             timeLeft: room.timeLeft, rScore: room.rScore, bScore: room.bScore,
@@ -194,9 +197,9 @@ function handleMsg(ws, sid, msg) {
           });
           return;
         }
+        // Mode changed or room is over — leave old room
         removePlayerFromRoom(sid);
       }
-      const { mode = 'tdm', team = 'red', name = 'PLAYER', playerId, partyCode } = msg;
       c.playerId = playerId || sid;
       c.name = (name || 'PLAYER').slice(0, 16);
       c.team = team === 'blue' ? 'blue' : 'red';
