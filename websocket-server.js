@@ -23,7 +23,7 @@ const CTF_TIME       = 1080;
 const TDM_WIN_SCORE  = 300;
 const CTF_WIN_SCORE  = 10;
 const TICK_MS        = 1000;
-const STATE_THROTTLE = 33;
+const STATE_THROTTLE = 8;   // ~120fps cap for high-refresh displays
 
 const STREAK_LABELS = {
   2 : 'DOUBLE KILL', 3 : 'TRIPLE KILL', 4 : 'QUAD KILL',
@@ -50,6 +50,7 @@ function createSecurityProfile() {
     killTimestamps: [], bulletTimestamps: [],
     lastPosition: null, lastPosTime: 0,
     violations: 0, banned: false,
+    teleportGraceUntil: 0,
   };
 }
 
@@ -71,14 +72,20 @@ function checkBulletRate(p) {
 
 function checkSpeed(p, x, y) {
   const now = Date.now();
+  // Always initialise on first call
   if (!p.lastPosition || !p.lastPosTime) {
     p.lastPosition = { x, y }; p.lastPosTime = now; return true;
   }
+  // Skip check during grace period after a teleport (tank enter/exit, respawn)
+  if (p.teleportGraceUntil && now < p.teleportGraceUntil) {
+    p.lastPosition = { x, y }; p.lastPosTime = now; return true;
+  }
   const dt = now - p.lastPosTime;
+  // Ignore frames too close together — tiny dt magnifies noise
   if (dt < 16) return true;
   const dx = x - p.lastPosition.x, dy = y - p.lastPosition.y;
   const dist = Math.sqrt(dx * dx + dy * dy);
-  const speed = dist / (dt / 16);
+  const speed = dist / (dt / 16);   // pixels-per-frame at 60 fps baseline
   p.lastPosition = { x, y }; p.lastPosTime = now;
   if (speed > MAX_SPEED) { p.violations++; return false; }
   return true;
@@ -362,10 +369,11 @@ function handleMsg(ws, sid, msg) {
           break;
         }
       }
-      // Reset speed tracking on teleport to avoid false positive on next frame
+      // Reset speed tracking on teleport + apply 300ms grace window for the next frames
       if (msg.teleport) {
         c.security.lastPosition = { x: msg.x, y: msg.y };
-        c.security.lastPosTime = now;
+        c.security.lastPosTime = Date.now();
+        c.security.teleportGraceUntil = Date.now() + 300; // 300ms grace after teleport
       }
       broadcastRoom(c.roomId, msg, sid);
       break;
@@ -408,9 +416,10 @@ function handleMsg(ws, sid, msg) {
 server.listen(PORT, () => {
   console.log(`
 ╔═══════════════════════════════════════════════════╗
-║    LUNAFYRE SERVER v4.1 — SECURE EDITION          ║
+║    LUNAFYRE SERVER v4.2 — SECURE EDITION          ║
 ║  Port      : ${PORT.toString().padEnd(4)} │ Anti-Cheat: ENABLED       ║
 ║  Max Speed : ${MAX_SPEED} t/f │ Max Damage: ${MAX_DAMAGE_PER_HIT}            ║
+║  State Hz  : 120hz│ Teleport Grace: 300ms        ║
 ╚═══════════════════════════════════════════════════╝
   `);
 });
