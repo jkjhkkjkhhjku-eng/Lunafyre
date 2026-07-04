@@ -12,6 +12,9 @@ const PORT = process.env.PORT || 8080;
 app.use(cors());
 app.use(express.json());
 
+// Serve the game client (index.html) as static files
+app.use(express.static(__dirname));
+
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 
@@ -146,7 +149,8 @@ function sendTo(ws, obj) {
 }
 
 // ── HTTP ──────────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({
+// NOTE: '/' is now served by express.static (index.html) above.
+app.get('/api/status', (req, res) => res.json({
   status: 'online', rooms: rooms.size, players: clients.size,
   uptime: process.uptime(), time: new Date().toISOString(),
 }));
