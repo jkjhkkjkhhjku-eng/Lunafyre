@@ -120,7 +120,7 @@ function mmLaunch() {
       leaderboard: buildLeaderboard(room),
     });
     broadcastRoom(room.id, {
-      type: 'player_joined', playerId: c.playerId, name: c.name, team: c.team,
+      type: 'player_joined', playerId: c.playerId, name: c.name, team: c.team, skin: c.skin || 0,
       redCount: room.red.size, blueCount: room.blue.size,
     }, sid);
   }
@@ -264,7 +264,7 @@ app.get('/api/stats', (req, res) => {
 wss.on('connection', ws => {
   const sid = Math.random().toString(36).slice(2, 12);
   clients.set(sid, {
-    ws, sid, roomId: null, playerId: null, name: 'PLAYER', team: 'red',
+    ws, sid, roomId: null, playerId: null, name: 'PLAYER', team: 'red', skin: 0,
     lastStateMs: 0, kills: 0, deaths: 0, captures: 0,
     streak: 0, lastKillMs: 0,
   });
@@ -281,7 +281,7 @@ function handleMsg(ws, sid, msg) {
 
   switch (msg.type) {
     case 'mm_join_ctf': {
-      const { team = 'red', name = 'PLAYER', playerId } = msg;
+      const { team = 'red', name = 'PLAYER', playerId, skin = 0 } = msg;
       if (c.roomId) {
         const room = rooms.get(c.roomId);
         if (room && !room.over && room.mode === 'ctf') {
@@ -298,6 +298,7 @@ function handleMsg(ws, sid, msg) {
       c.playerId = playerId || sid;
       c.name = (name || 'PLAYER').slice(0, 16);
       c.team = team === 'blue' ? 'blue' : 'red';
+      c.skin = Math.max(0, Math.min(8, parseInt(skin) || 0));
       mmJoin(sid, c);
       break;
     }
@@ -307,7 +308,7 @@ function handleMsg(ws, sid, msg) {
       break;
     }
     case 'quick_join': {
-      const { mode = 'tdm', team = 'red', name = 'PLAYER', playerId, partyCode } = msg;
+      const { mode = 'tdm', team = 'red', name = 'PLAYER', playerId, partyCode, skin = 0 } = msg;
       mmLeave(sid);
       // BUG FIX: Check if player is in a room AND if that room matches the requested mode
       if (c.roomId) {
@@ -328,6 +329,7 @@ function handleMsg(ws, sid, msg) {
       c.playerId = playerId || sid;
       c.name = (name || 'PLAYER').slice(0, 16);
       c.team = team === 'blue' ? 'blue' : 'red';
+      c.skin = Math.max(0, Math.min(8, parseInt(skin) || 0));
       c.lastStateMs = 0;
       c.kills = 0; c.deaths = 0; c.captures = 0; c.streak = 0; c.lastKillMs = 0;
       let room = null;
@@ -349,7 +351,7 @@ function handleMsg(ws, sid, msg) {
         leaderboard: buildLeaderboard(room),
       });
       broadcastRoom(room.id, {
-        type: 'player_joined', playerId: c.playerId, name: c.name, team: c.team,
+        type: 'player_joined', playerId: c.playerId, name: c.name, team: c.team, skin: c.skin || 0,
         redCount: room.red.size, blueCount: room.blue.size,
       }, sid);
       console.log(`✅ ${c.name} [${c.team}] → ${room.id}`);
