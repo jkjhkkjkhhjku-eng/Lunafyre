@@ -33,6 +33,100 @@ const STREAK_LABELS = {
 };
 const STREAK_RESET_MS = 4500;
 
+// ── CTF MATCHMAKING (5v5) ────────────────────────────────────
+const MM_PER_TEAM   = 5;
+const MM_FILL_S     = 240;              // 4 min lobby-fill window
+const MM_TOTAL_S    = 1800;             // 30 min max search time
+const mm = {
+  red: new Map(), blue: new Map(),
+  startedAt: 0, interval: null,
+  phase: 'idle',                        // 'idle' | 'fill' | 'wait_opponent'
+};
+
+function mmSnapshot() {
+  const elapsed = Math.floor((Date.now() - mm.startedAt) / 1000);
+  return {
+    type: 'mm_state',
+    phase: mm.phase,
+    red: mm.red.size, blue: mm.blue.size,
+    perTeam: MM_PER_TEAM,
+    fillLeft: Math.max(0, MM_FILL_S - elapsed),
+    totalLeft: Math.max(0, MM_TOTAL_S - elapsed),
+    serverTime: Date.now(),
+  };
+}
+function mmBroadcast(msgObj) {
+  const str = JSON.stringify(msgObj);
+  for (const [, c] of mm.red) if (c.ws.readyState === WebSocket.OPEN) c.ws.send(str);
+  for (const [, c] of mm.blue) if (c.ws.readyState === WebSocket.OPEN) c.ws.send(str);
+}
+function mmStartClock() {
+  if (mm.interval) return;
+  mm.startedAt = Date.now();
+  mm.interval = setInterval(mmTick, 1000);
+}
+function mmStopClockIfEmpty() {
+  if (mm.red.size === 0 && mm.blue.size === 0) {
+    clearInterval(mm.interval); mm.interval = null; mm.phase = 'idle';
+  }
+}
+function mmTick() {
+  const elapsed = Math.floor((Date.now() - mm.startedAt) / 1000);
+  if (mm.phase === 'fill' && elapsed >= MM_FILL_S) {
+    if (mm.red.size > 0 && mm.blue.size > 0) return mmLaunch();
+    mm.phase = 'wait_opponent';         // one side empty — keep searching
+  }
+  if (mm.phase === 'wait_opponent' && mm.red.size > 0 && mm.blue.size > 0) {
+    return mmLaunch();                  // an opponent showed up — start now
+  }
+  if (elapsed >= MM_TOTAL_S && !(mm.red.size > 0 && mm.blue.size > 0)) {
+    mmBroadcast({ type: 'mm_failed', text: "Sorry we couldn't find any opponents for you :(" });
+    clearInterval(mm.interval); mm.interval = null; mm.phase = 'idle';
+    mm.red.clear(); mm.blue.clear();
+    return;
+  }
+  mmBroadcast(mmSnapshot());
+}
+function mmJoin(sid, c) {
+  removePlayerFromRoom(sid);            // leave any current room
+  mm.red.delete(sid); mm.blue.delete(sid);
+  c.playerId = c.playerId || sid;
+  (c.team === 'blue' ? mm.blue : mm.red).set(sid, c);
+  if (mm.phase === 'idle') mm.phase = 'fill';
+  mmStartClock();
+  if (mm.red.size >= MM_PER_TEAM && mm.blue.size >= MM_PER_TEAM) return mmLaunch();
+  if (mm.phase === 'wait_opponent' && mm.red.size > 0 && mm.blue.size > 0) return mmLaunch();
+  mmBroadcast(mmSnapshot());
+}
+function mmLeave(sid) {
+  mm.red.delete(sid); mm.blue.delete(sid);
+  mmBroadcast(mmSnapshot());
+  mmStopClockIfEmpty();
+}
+function mmLaunch() {
+  clearInterval(mm.interval); mm.interval = null;
+  const room = createRoom('ctf');
+  const queued = [...mm.red.entries(), ...mm.blue.entries()];
+  mm.red.clear(); mm.blue.clear(); mm.phase = 'idle';
+  mmBroadcast({ type: 'mm_started', roomId: room.id });
+  for (const [sid, c] of queued) {
+    c.lastStateMs = 0;
+    c.kills = 0; c.deaths = 0; c.captures = 0; c.streak = 0; c.lastKillMs = 0;
+    addPlayerToRoom(room, sid, c);
+    sendTo(c.ws, {
+      type: 'match_joined', roomId: room.id, team: c.team,
+      timeLeft: room.timeLeft, rScore: room.rScore, bScore: room.bScore,
+      mode: room.mode, redCount: room.red.size, blueCount: room.blue.size,
+      leaderboard: buildLeaderboard(room),
+    });
+    broadcastRoom(room.id, {
+      type: 'player_joined', playerId: c.playerId, name: c.name, team: c.team,
+      redCount: room.red.size, blueCount: room.blue.size,
+    }, sid);
+  }
+  console.log(`🚩 CTF 5v5 launched: ${room.id} (${room.red.size}v${room.blue.size})`);
+}
+
 
 // ── DATA ──────────────────────────────────────────────────────
 const rooms   = new Map();
@@ -176,8 +270,8 @@ wss.on('connection', ws => {
   });
   sendTo(ws, { type: 'connected', sid });
   ws.on('message', raw => { try { handleMsg(ws, sid, JSON.parse(raw)); } catch (e) {} });
-  ws.on('close', () => { removePlayerFromRoom(sid); clients.delete(sid); });
-  ws.on('error', () => { removePlayerFromRoom(sid); clients.delete(sid); });
+  ws.on('close', () => { mmLeave(sid); removePlayerFromRoom(sid); clients.delete(sid); });
+  ws.on('error', () => { mmLeave(sid); removePlayerFromRoom(sid); clients.delete(sid); });
 });
 
 // ── MESSAGE HANDLER ───────────────────────────────────────────
@@ -186,8 +280,35 @@ function handleMsg(ws, sid, msg) {
   if (!c) return;
 
   switch (msg.type) {
+    case 'mm_join_ctf': {
+      const { team = 'red', name = 'PLAYER', playerId } = msg;
+      if (c.roomId) {
+        const room = rooms.get(c.roomId);
+        if (room && !room.over && room.mode === 'ctf') {
+          // Already in a CTF match — rejoin directly
+          sendTo(ws, {
+            type: 'match_joined', roomId: room.id, team: c.team,
+            timeLeft: room.timeLeft, rScore: room.rScore, bScore: room.bScore,
+            mode: room.mode, redCount: room.red.size, blueCount: room.blue.size,
+            leaderboard: buildLeaderboard(room),
+          });
+          return;
+        }
+      }
+      c.playerId = playerId || sid;
+      c.name = (name || 'PLAYER').slice(0, 16);
+      c.team = team === 'blue' ? 'blue' : 'red';
+      mmJoin(sid, c);
+      break;
+    }
+    case 'mm_cancel': {
+      mmLeave(sid);
+      sendTo(ws, { type: 'mm_cancelled' });
+      break;
+    }
     case 'quick_join': {
       const { mode = 'tdm', team = 'red', name = 'PLAYER', playerId, partyCode } = msg;
+      mmLeave(sid);
       // BUG FIX: Check if player is in a room AND if that room matches the requested mode
       if (c.roomId) {
         const room = rooms.get(c.roomId);
@@ -306,6 +427,7 @@ function handleMsg(ws, sid, msg) {
     }
     case 'leave':
     case 'bye': {
+      mmLeave(sid);
       removePlayerFromRoom(sid);
       break;
     }
