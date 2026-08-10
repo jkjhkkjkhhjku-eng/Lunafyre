@@ -26,6 +26,7 @@ const TDM_WIN_SCORE  = 300;
 const CTF_WIN_SCORE  = 10;
 
 // ── DEMOLITION MODE ────────────────────────────────────────────
+const DEMO_BOMB_TILE_X = 56, DEMO_BOMB_TILE_Y = 40; // mid-map between A/B sites
 const DEMO_ROUNDS      = 8;       // max rounds
 const DEMO_SIDE_SWITCH = 4;       // swap attack/defend after round 4
 const DEMO_WIN_ROUNDS  = 5;       // first to 5 round-wins takes the match
@@ -326,12 +327,13 @@ function demoNextRound(room, winnerTeam, loserTeam) {
     demoEvent(room, 'side_switch', { atk: demoAtkTeam(d.round) });
   }
   d.atk = demoAtkTeam(d.round);
-  d.phase = 'BUY';
+    d.phase = 'BUY';
   d.phaseEndsAt = Date.now() + DEMO_BUY_MS;
   d.bomb = {
-    state: 'idle', x: 0, y: 0, site: null, carrier: null,
+    state: 'dropped', x: DEMO_BOMB_TILE_X * 32 + 16, y: DEMO_BOMB_TILE_Y * 32 + 16, site: null, carrier: null,
     fuseEndsAt: 0, actionKind: null, actionBy: null, actionStart: 0,
   };
+  demoEvent(room, 'bomb_spawn', { x: d.bomb.x, y: d.bomb.y }); // bomb on the ground for pick-up
   demoEvent(room, 'round_start', { round: d.round, atk: d.atk });
   demoBroadcast(room, demoSnapshot(room));
 }
@@ -394,22 +396,14 @@ function demoTick(room) {
 
 function demoOnKill(room, victimSid) {
   if (!room.demo || room.demo.phase !== 'LIVE') return;
-  const roomId = room.id;
   room.dead.add(victimSid);
-  // Dropped bomb if the carrier died
   const b = room.demo.bomb;
   if (b.carrier === victimSid) {
     const v = [...room.players.values()].find(p => p.playerId === victimSid);
     demoBombDrop(room, v && v.lastX ? v.lastX : b.x, v && v.lastY ? v.lastY : b.y);
   }
-  const defTeam = room.demo.atk === 'red' ? 'blue' : 'red';
-  const atkTeam = room.demo.atk;
-  const atkAlive = demoAlive(room, atkTeam);
-  const defAlive = demoAlive(room, defTeam);
-  if (defAlive === 0 && atkAlive === 0) return demoAwardRound(room, defTeam, 'draw_team_wipe');
-  if (defAlive === 0) return demoAwardRound(room, atkTeam, 'elim');
-  if (atkAlive === 0 && room.demo.bomb.state !== 'planted') return demoAwardRound(room, defTeam, 'elim');
-  demoBroadcast(room, demoSnapshot(room));
+  demoResolveElim(room); // single elimination source-of-truth (kill or leave)
+  if (room.demo.phase === 'LIVE') demoBroadcast(room, demoSnapshot(room));
 }
 
 function demoOnDisconnect(room, playerId) {
@@ -464,6 +458,7 @@ function removePlayerFromRoom(sid) {
   c.roomId = null;
   if (room.players.size === 0 && !room.over) {
     clearInterval(room.interval);
+    if (room.timeout) { try { clearTimeout(room.timeout); } catch (e) {} room.timeout = null; } // demo round-end timer
     rooms.delete(room.id);
   }
 }
