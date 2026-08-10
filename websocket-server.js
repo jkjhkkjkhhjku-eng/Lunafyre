@@ -26,14 +26,21 @@ const TDM_WIN_SCORE  = 300;
 const CTF_WIN_SCORE  = 10;
 
 // ── DEMOLITION MODE ────────────────────────────────────────────
-const DEMO_BOMB_TILE_X = 56, DEMO_BOMB_TILE_Y = 40; // mid-map between A/B sites
+// Bomb begins at the ATTACKER's own base; plant zone sits mid-field on the DEFENDER's side.
+const DEMO_BOMB_SPAWN  = { red:{x:25,y:21}, blue:{x:87,y:60} };             // attacker base corner (tiles)
+const DEMO_PLANT_SITE  = { red:{x:89,y:40,r:5}, blue:{x:23,y:40,r:5} };     // key = attacking team → zone on enemy side
+function demoBombAtSpawn(atkTeam){
+  const sp = DEMO_BOMB_SPAWN[atkTeam] || DEMO_BOMB_SPAWN.red;
+  return { state:'dropped', x:sp.x*32+16, y:sp.y*32+16, site:null, carrier:null,
+           fuseEndsAt:0, actionKind:null, actionBy:null, actionStart:0 };
+}
 const DEMO_ROUNDS      = 8;       // max rounds
 const DEMO_SIDE_SWITCH = 4;       // swap attack/defend after round 4
 const DEMO_WIN_ROUNDS  = 5;       // first to 5 round-wins takes the match
 const DEMO_BUY_MS      = 15000;   // buy/prep phase
 const DEMO_LIVE_MS     = 100000;  // live round phase
 const DEMO_POST_MS     = 5000;    // post-round phase
-const DEMO_PLANT_MS    = 4000;    // bomb plant channel time
+const DEMO_PLANT_MS    = 5000;    // bomb plant channel time (5s hold)
 const DEMO_DEFUSE_MS   = 5000;    // defuse channel time
 const DEMO_FUSE_MS     = 35000;   // planted-bomb fuse
 const TICK_MS        = 1000;
@@ -112,8 +119,72 @@ function mmJoin(sid, c) {
 }
 function mmLeave(sid) {
   mm.red.delete(sid); mm.blue.delete(sid);
+  dm.red.delete(sid); dm.blue.delete(sid);
   mmBroadcast(mmSnapshot());
+  dmBroadcast(dmSnapshot());
   mmStopClockIfEmpty();
+}
+// ── DEMOLITION MATCHMAKING (5v5 queued like CTF) ───────────────
+const dm = { red: new Map(), blue: new Map(), startedAt: 0, interval: null, phase: 'idle' };
+function dmSnapshot() {
+  const elapsed = Math.floor((Date.now() - dm.startedAt) / 1000);
+  return { type: 'mm_state', mode: 'demo', phase: dm.phase, red: dm.red.size, blue: dm.blue.size,
+           perTeam: MM_PER_TEAM, fillLeft: Math.max(0, MM_FILL_S - elapsed),
+           totalLeft: Math.max(0, MM_TOTAL_S - elapsed), serverTime: Date.now() };
+}
+function dmBroadcast(o) {
+  const s = JSON.stringify(o);
+  for (const [, c] of dm.red)  if (c.ws.readyState === WebSocket.OPEN) c.ws.send(s);
+  for (const [, c] of dm.blue) if (c.ws.readyState === WebSocket.OPEN) c.ws.send(s);
+}
+function dmStartClock(){ if (dm.interval) return; dm.startedAt = Date.now(); dm.interval = setInterval(dmTick, 1000); }
+function dmStopClockIfEmpty(){ if (dm.red.size === 0 && dm.blue.size === 0) { clearInterval(dm.interval); dm.interval = null; dm.phase = 'idle'; } }
+function dmTick() {
+  const elapsed = Math.floor((Date.now() - dm.startedAt) / 1000);
+  if (dm.phase === 'fill' && elapsed >= MM_FILL_S) {
+    if (dm.red.size > 0 && dm.blue.size > 0) return dmLaunch();
+    dm.phase = 'wait_opponent';
+  }
+  if (dm.phase === 'wait_opponent' && dm.red.size > 0 && dm.blue.size > 0) return dmLaunch();
+  if (elapsed >= MM_TOTAL_S && !(dm.red.size > 0 && dm.blue.size > 0)) {
+    dmBroadcast({ type: 'mm_failed', text: "Sorry we couldn't find any opponents for you :(" });
+    clearInterval(dm.interval); dm.interval = null; dm.phase = 'idle';
+    dm.red.clear(); dm.blue.clear(); return;
+  }
+  dmBroadcast(dmSnapshot());
+}
+function dmJoin(sid, c) {
+  removePlayerFromRoom(sid);
+  dm.red.delete(sid); dm.blue.delete(sid);
+  c.playerId = c.playerId || sid;
+  (c.team === 'blue' ? dm.blue : dm.red).set(sid, c);
+  if (dm.phase === 'idle') dm.phase = 'fill';
+  dmStartClock();
+  if (dm.red.size >= MM_PER_TEAM && dm.blue.size >= MM_PER_TEAM) return dmLaunch();
+  if (dm.phase === 'wait_opponent' && dm.red.size > 0 && dm.blue.size > 0) return dmLaunch();
+  dmBroadcast(dmSnapshot());
+}
+function dmLaunch() {
+  clearInterval(dm.interval); dm.interval = null;
+  const room = createRoom('demo');
+  const queued = [...dm.red.entries(), ...dm.blue.entries()];
+  dm.red.clear(); dm.blue.clear(); dm.phase = 'idle';
+  dmBroadcast({ type: 'mm_started', roomId: room.id });
+  for (const [sid, c] of queued) {
+    c.lastStateMs = 0; c.kills = 0; c.deaths = 0; c.captures = 0; c.streak = 0; c.lastKillMs = 0;
+    addPlayerToRoom(room, sid, c);
+    sendTo(c.ws, {
+      type: 'match_joined', roomId: room.id, team: c.team,
+      timeLeft: room.timeLeft, rScore: room.rScore, bScore: room.bScore,
+      mode: room.mode, redCount: room.red.size, blueCount: room.blue.size,
+      leaderboard: buildLeaderboard(room), demo: demoSnapshot(room), atkTeam: room.demo.atk,
+    });
+    broadcastRoom(room.id, {
+      type: 'player_joined', playerId: c.playerId, name: c.name, team: c.team, skin: c.skin || 0,
+      redCount: room.red.size, blueCount: room.blue.size,
+    }, sid);
+  }
+  console.log(`💣 DEMOLITION 5v5 launched: ${room.id} (${room.red.size}v${room.blue.size})`);
 }
 function mmLaunch() {
   clearInterval(mm.interval); mm.interval = null;
@@ -211,24 +282,24 @@ function endRoom(room, winner) {
 }
 
 // ══ DEMOLITION STATE MACHINE (server-authoritative) ═══════════
-function demoAtkTeam(round) {
-  // Red attacks first half; teams swap roles after DEMO_SIDE_SWITCH rounds
-  return (round <= DEMO_SIDE_SWITCH) ? 'red' : 'blue';
+function demoAtkTeam(room, round) {
+  // Random first attacker (stored on the room); sides swap after DEMO_SIDE_SWITCH rounds
+  const first = room.demoFirst || (room.demoFirst = (Math.random() < 0.5 ? 'red' : 'blue'));
+  return (round <= DEMO_SIDE_SWITCH) ? first : (first === 'red' ? 'blue' : 'red');
 }
 
 function demoBroadcast(room, obj) { broadcastRoom(room.id, obj); }
 
 function demoInit(room) {
+  const atk = demoAtkTeam(room, 1); // random side plants first
   room.demo = {
-    round: 1, atk: 'red', phase: 'BUY', phaseEndsAt: Date.now() + DEMO_BUY_MS,
-    bomb: {
-      state: 'idle', x: 0, y: 0, site: null, carrier: null,
-      fuseEndsAt: 0, actionKind: null, actionBy: null, actionStart: 0,
-    },
+    round: 1, atk, phase: 'BUY', phaseEndsAt: Date.now() + DEMO_BUY_MS,
+    bomb: demoBombAtSpawn(atk), // bomb waiting at the attackers' base
   };
   room.dead = new Set();
   room.rScore = 0; room.bScore = 0; // repurpose demo scores → round wins
-  demoBroadcast(room, { type: 'demo_event', ev: 'match_start', round: 1, atk: 'red' });
+  demoBroadcast(room, { type: 'demo_event', ev: 'match_start', round: 1, atk });
+  demoBroadcast(room, { type: 'demo_event', ev: 'bomb_spawn', x: room.demo.bomb.x, y: room.demo.bomb.y });
   demoBroadcast(room, demoSnapshot(room));
 }
 
@@ -324,16 +395,13 @@ function demoNextRound(room, winnerTeam, loserTeam) {
   const d = room.demo;
   d.round++;
   if (d.round === DEMO_SIDE_SWITCH + 1) {
-    demoEvent(room, 'side_switch', { atk: demoAtkTeam(d.round) });
+    demoEvent(room, 'side_switch', { atk: demoAtkTeam(room, d.round) });
   }
-  d.atk = demoAtkTeam(d.round);
-    d.phase = 'BUY';
+  d.atk = demoAtkTeam(room, d.round);
+  d.phase = 'BUY';
   d.phaseEndsAt = Date.now() + DEMO_BUY_MS;
-  d.bomb = {
-    state: 'dropped', x: DEMO_BOMB_TILE_X * 32 + 16, y: DEMO_BOMB_TILE_Y * 32 + 16, site: null, carrier: null,
-    fuseEndsAt: 0, actionKind: null, actionBy: null, actionStart: 0,
-  };
-  demoEvent(room, 'bomb_spawn', { x: d.bomb.x, y: d.bomb.y }); // bomb on the ground for pick-up
+  d.bomb = demoBombAtSpawn(d.atk); // fresh bomb at the new attackers' base (manual E-pickup)
+  demoEvent(room, 'bomb_spawn', { x: d.bomb.x, y: d.bomb.y });
   demoEvent(room, 'round_start', { round: d.round, atk: d.atk });
   demoBroadcast(room, demoSnapshot(room));
 }
@@ -543,8 +611,39 @@ function handleMsg(ws, sid, msg) {
       sendTo(ws, { type: 'mm_cancelled' });
       break;
     }
+    case 'mm_join_demo': {
+      const { team = 'red', name = 'PLAYER', playerId, skin = 0 } = msg;
+      if (c.roomId) {
+        const room = rooms.get(c.roomId);
+        if (room && !room.over && room.mode === 'demo') {
+          sendTo(ws, {
+            type: 'match_joined', roomId: room.id, team: c.team,
+            timeLeft: room.timeLeft, rScore: room.rScore, bScore: room.bScore,
+            mode: room.mode, redCount: room.red.size, blueCount: room.blue.size,
+            leaderboard: buildLeaderboard(room), demo: demoSnapshot(room), atkTeam: room.demo.atk,
+          });
+          return;
+        }
+      }
+      c.playerId = playerId || sid;
+      c.name = (name || 'PLAYER').slice(0, 16);
+      c.team = team === 'blue' ? 'blue' : 'red';
+      c.skin = Math.max(0, Math.min(8, parseInt(skin) || 0));
+      dmJoin(sid, c);
+      break;
+    }
+    case 'mm_cancel_demo': {
+      dm.red.delete(sid); dm.blue.delete(sid);
+      dmBroadcast(dmSnapshot()); dmStopClockIfEmpty();
+      sendTo(ws, { type: 'mm_cancelled' });
+      break;
+    }
     case 'quick_join': {
       const { mode = 'tdm', team = 'red', name = 'PLAYER', playerId, partyCode, skin = 0 } = msg;
+      if (mode === 'demo') { // demo must come through its matchmaking queue
+        sendTo(ws, { type: 'mm_failed', text: 'Please use Demolition matchmaking to join.' });
+        break;
+      }
       mmLeave(sid);
       // BUG FIX: Check if player is in a room AND if that room matches the requested mode
       if (c.roomId) {
@@ -722,8 +821,14 @@ function handleMsg(ws, sid, msg) {
       if (d.phase !== 'LIVE' || d.bomb.state !== 'carried') break;
       if (d.bomb.carrier !== c.playerId) break;
       if (d.bomb.actionKind) break;
-      const site = msg.site === 'B' ? 'B' : 'A';
-      d.bomb.site = site; d.bomb.x = msg.x || d.bomb.x; d.bomb.y = msg.y || d.bomb.y;
+      // Server-authoritative position check: must be inside this round's target zone
+      const site = DEMO_PLANT_SITE[d.atk];
+      if (!site) break;
+      const px = msg.x || 0, py = msg.y || 0;
+      const dx = px - site.x * 32, dy = py - site.y * 32;
+      if (Math.sqrt(dx * dx + dy * dy) > site.r * 32) break; // outside the plant zone — reject
+      d.bomb.site = d.atk; // store the ATTACKING team as the site id (client resolves the zone)
+      d.bomb.x = px; d.bomb.y = py;
       d.bomb.actionKind = 'plant'; d.bomb.actionBy = c.playerId; d.bomb.actionStart = Date.now();
       demoEvent(room, 'plant_start', { id: c.playerId, site, x: d.bomb.x, y: d.bomb.y });
       demoBroadcast(room, demoSnapshot(room));
