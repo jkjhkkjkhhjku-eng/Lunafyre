@@ -24,6 +24,17 @@ const TDM_TIME       = 1200;
 const CTF_TIME       = 1080;
 const TDM_WIN_SCORE  = 300;
 const CTF_WIN_SCORE  = 10;
+
+// ── DEMOLITION MODE ────────────────────────────────────────────
+const DEMO_ROUNDS      = 8;       // max rounds
+const DEMO_SIDE_SWITCH = 4;       // swap attack/defend after round 4
+const DEMO_WIN_ROUNDS  = 5;       // first to 5 round-wins takes the match
+const DEMO_BUY_MS      = 15000;   // buy/prep phase
+const DEMO_LIVE_MS     = 100000;  // live round phase
+const DEMO_POST_MS     = 5000;    // post-round phase
+const DEMO_PLANT_MS    = 4000;    // bomb plant channel time
+const DEMO_DEFUSE_MS   = 5000;    // defuse channel time
+const DEMO_FUSE_MS     = 35000;   // planted-bomb fuse
 const TICK_MS        = 1000;
 const STATE_THROTTLE = 8;   // ~120fps cap for high-refresh displays
 
@@ -162,7 +173,9 @@ function createRoom(mode) {
     id, mode, timeLeft: mode === 'ctf' ? CTF_TIME : TDM_TIME,
     rScore: 0, bScore: 0, red: new Map(), blue: new Map(),
     players: new Map(), interval: null, over: false, startTs: Date.now(),
+    demo: null, dead: null, timeout: null,
   };
+  if (mode === 'demo') demoInit(room);
   rooms.set(id, room);
   room.interval = setInterval(() => tickRoom(room), TICK_MS);
   console.log(`🏟  Room created: ${id}`);
@@ -171,6 +184,7 @@ function createRoom(mode) {
 
 function tickRoom(room) {
   if (room.over) return;
+  if (room.mode === 'demo') { demoTick(room); return; }
   room.timeLeft = Math.max(0, room.timeLeft - 1);
   broadcastRoom(room.id, { type: 'tick', t: room.timeLeft, rs: room.rScore, bs: room.bScore });
   if (room.timeLeft <= 0) endRoom(room, null);
@@ -180,6 +194,7 @@ function endRoom(room, winner) {
   if (room.over) return;
   room.over = true;
   clearInterval(room.interval);
+  if (room.timeout) { try { clearTimeout(room.timeout); } catch (e) {} room.timeout = null; } // no orphaned demo round timers
   broadcastRoom(room.id, {
     type: 'game_over', winner, rs: room.rScore, bs: room.bScore,
     leaderboard: buildLeaderboard(room),
@@ -193,6 +208,230 @@ function endRoom(room, winner) {
     rooms.delete(room.id);
   }, 30_000);
 }
+
+// ══ DEMOLITION STATE MACHINE (server-authoritative) ═══════════
+function demoAtkTeam(round) {
+  // Red attacks first half; teams swap roles after DEMO_SIDE_SWITCH rounds
+  return (round <= DEMO_SIDE_SWITCH) ? 'red' : 'blue';
+}
+
+function demoBroadcast(room, obj) { broadcastRoom(room.id, obj); }
+
+function demoInit(room) {
+  room.demo = {
+    round: 1, atk: 'red', phase: 'BUY', phaseEndsAt: Date.now() + DEMO_BUY_MS,
+    bomb: {
+      state: 'idle', x: 0, y: 0, site: null, carrier: null,
+      fuseEndsAt: 0, actionKind: null, actionBy: null, actionStart: 0,
+    },
+  };
+  room.dead = new Set();
+  room.rScore = 0; room.bScore = 0; // repurpose demo scores → round wins
+  demoBroadcast(room, { type: 'demo_event', ev: 'match_start', round: 1, atk: 'red' });
+  demoBroadcast(room, demoSnapshot(room));
+}
+
+function demoSnapshot(room) {
+  const d = room.demo, b = d.bomb;
+  return {
+    type: 'demo_state',
+    phase: d.phase,
+    phaseLeft: Math.max(0, Math.ceil((d.phaseEndsAt - Date.now()) / 1000)),
+    round: d.round, atk: d.atk, rWins: room.rScore, bWins: room.bScore,
+    bomb: {
+      state: b.state, x: b.x, y: b.y, site: b.site, carrier: b.carrier,
+      by: b.actionBy, prog: demoActionProg(room),
+      fuseLeft: b.state === 'planted' ? Math.max(0, Math.ceil((b.fuseEndsAt - Date.now()) / 1000)) : 0,
+    },
+  };
+}
+
+function demoActionProg(room) {
+  const d = room.demo;
+  if (!d || !d.bomb.actionKind) return 0;
+  const dur = d.bomb.actionKind === 'plant' ? DEMO_PLANT_MS : DEMO_DEFUSE_MS;
+  return Math.max(0, Math.min(1, (Date.now() - d.bomb.actionStart) / dur));
+}
+
+function demoEvent(room, ev, extra = {}) {
+  demoBroadcast(room, { type: 'demo_event', ev, ...extra });
+}
+
+function demoCancelAction(room, tag) {
+  const b = room.demo && room.demo.bomb;
+  if (!b || !b.actionKind) return;
+  demoEvent(room, b.actionKind === 'plant' ? 'plant_cancel' : 'defuse_cancel',
+    { id: b.actionBy, why: tag || '' });
+  b.actionKind = null; b.actionBy = null; b.actionStart = 0;
+  demoBroadcast(room, demoSnapshot(room));
+}
+
+function demoBombDrop(room, x, y) {
+  const b = room.demo.bomb;
+  b.state = 'dropped'; b.carrier = null; b.x = x; b.y = y;
+  demoEvent(room, 'bomb_drop', { x, y });
+}
+
+function demoAlive(room, team) {
+  const teamMap = team === 'red' ? room.red : room.blue;
+  let n = 0;
+  for (const [sid, c] of teamMap) if (!room.dead.has(c.playerId)) n++;
+  return n;
+}
+
+function demoAwardRound(room, winnerTeam, why) {
+  if (room.over || room.demo.phase !== 'LIVE') return;
+  // Revalidate: the score winner can't award a round to an empty server
+  if (room.players.size === 0) return void endRoom(room, null);
+  const loserTeam = winnerTeam === 'red' ? 'blue' : 'red';
+  if (winnerTeam === 'red') room.rScore++; else room.bScore++;
+  demoEvent(room, 'round_end', { winner: winnerTeam, why, round: room.demo.round });
+  broadcastLeaderboard(room);
+  demoBroadcast(room, demoSnapshot(room));
+  demoCheckMatch(room);
+  if (room.over) return;
+  room.demo.phase = 'POST';
+  room.demo.phaseEndsAt = Date.now() + DEMO_POST_MS;
+  room.timeout = setTimeout(() => demoNextRound(room, winnerTeam, loserTeam), DEMO_POST_MS);
+  console.log(`💣 ${room.id} round ${room.demo.round} → ${winnerTeam} (${why}) [${room.rScore}-${room.bScore}]`);
+}
+
+function demoCheckMatch(room) {
+  if (room.rScore >= DEMO_WIN_ROUNDS) return void endRoom(room, 'red');
+  if (room.bScore >= DEMO_WIN_ROUNDS) return void endRoom(room, 'blue');
+  if (room.demo.round < DEMO_ROUNDS) return;
+  // All 8 rounds played — race to the remaining round-win target or draw
+  if (room.rScore > room.bScore) return void endRoom(room, 'red');
+  if (room.bScore > room.rScore) return void endRoom(room, 'blue');
+  // Tie-breaker: total kills across the match decide; equal kills → draw
+  let rk = 0, bk = 0;
+  for (const [, c] of room.players) {
+    if (c.team === 'red') rk += c.kills || 0; else bk += c.kills || 0;
+  }
+  const winner = rk > bk ? 'red' : bk > rk ? 'blue' : 'draw';
+  if (winner !== 'draw') demoEvent(room, 'tiebreak', { winner, rk, bk });
+  endRoom(room, winner);
+}
+
+function demoNextRound(room, winnerTeam, loserTeam) {
+  if (room.over) return;
+  if (room.players.size === 0) return void endRoom(room, null); // empty room — do not spin up another round
+  // Per-round elimination tallies persist for spectators; wipe for next round
+  winnerTeam = null; loserTeam = null;
+  room.dead.clear();
+  room.timeout = null;
+  const d = room.demo;
+  d.round++;
+  if (d.round === DEMO_SIDE_SWITCH + 1) {
+    demoEvent(room, 'side_switch', { atk: demoAtkTeam(d.round) });
+  }
+  d.atk = demoAtkTeam(d.round);
+  d.phase = 'BUY';
+  d.phaseEndsAt = Date.now() + DEMO_BUY_MS;
+  d.bomb = {
+    state: 'idle', x: 0, y: 0, site: null, carrier: null,
+    fuseEndsAt: 0, actionKind: null, actionBy: null, actionStart: 0,
+  };
+  demoEvent(room, 'round_start', { round: d.round, atk: d.atk });
+  demoBroadcast(room, demoSnapshot(room));
+}
+
+function demoTick(room) {
+  const d = room.demo;
+  if (!d) return;
+  const now = Date.now();
+  if (room.players.size === 0) return; // room teardown is imminent — no more demo work
+
+  // Live plant / defuse channel resolution
+  if (d.phase === 'LIVE' && d.bomb.actionKind) {
+    const actor = [...room.players.values()].find(p => p.playerId === d.bomb.actionBy);
+    if (!actor || room.dead.has(actor.playerId)) {
+      demoCancelAction(room, 'actor_gone');
+    } else {
+      const dur = d.bomb.actionKind === 'plant' ? DEMO_PLANT_MS : DEMO_DEFUSE_MS;
+      const frac = (now - d.bomb.actionStart) / dur;
+      if (frac >= 1) {
+        if (d.bomb.actionKind === 'plant') {
+          d.bomb.state = 'planted'; d.bomb.carrier = null;
+          d.bomb.fuseEndsAt = now + DEMO_FUSE_MS;
+          d.bomb.actionKind = null; d.bomb.actionBy = null; d.bomb.actionStart = 0;
+          demoEvent(room, 'planted', { site: d.bomb.site, by: actor.playerId, x: d.bomb.x, y: d.bomb.y });
+        } else {
+          d.bomb.actionKind = null; d.bomb.actionBy = null; d.bomb.actionStart = 0;
+          demoEvent(room, 'defused', { by: actor.playerId });
+          demoSnapshot(room); // keep payload fresh before round award
+          return demoAwardRound(room, d.atk === 'red' ? 'blue' : 'red', 'defuse');
+        }
+      }
+    }
+  }
+
+  // Fuse detonation
+  if (d.phase === 'LIVE' && d.bomb.state === 'planted' && now >= d.bomb.fuseEndsAt) {
+    d.bomb.state = 'exploded';
+    demoEvent(room, 'explode', { site: d.bomb.site });
+    return demoAwardRound(room, d.atk, 'explode');
+  }
+
+  // Phase transitions
+  if (now >= d.phaseEndsAt) {
+    if (d.phase === 'BUY') {
+      d.phase = 'LIVE';
+      d.phaseEndsAt = now + DEMO_LIVE_MS;
+      demoEvent(room, 'live', { round: d.round, atk: d.atk });
+      demoBroadcast(room, demoSnapshot(room));
+    } else if (d.phase === 'LIVE') {
+      // Time expired — defenders hold the site
+      return demoAwardRound(room, d.atk === 'red' ? 'blue' : 'red', 'time');
+    }
+    // POST transitions are driven by the endRound timeout
+  }
+
+  // 1 Hz authoritative sync (phaseLeft / fuseLeft) — piggybacks the normal tick slot
+  broadcastRoom(room.id, { type: 'tick', t: Math.max(0, Math.ceil((d.phaseEndsAt - now) / 1000)), rs: room.rScore, bs: room.bScore });
+  demoBroadcast(room, demoSnapshot(room));
+}
+
+function demoOnKill(room, victimSid) {
+  if (!room.demo || room.demo.phase !== 'LIVE') return;
+  const roomId = room.id;
+  room.dead.add(victimSid);
+  // Dropped bomb if the carrier died
+  const b = room.demo.bomb;
+  if (b.carrier === victimSid) {
+    const v = [...room.players.values()].find(p => p.playerId === victimSid);
+    demoBombDrop(room, v && v.lastX ? v.lastX : b.x, v && v.lastY ? v.lastY : b.y);
+  }
+  const defTeam = room.demo.atk === 'red' ? 'blue' : 'red';
+  const atkTeam = room.demo.atk;
+  const atkAlive = demoAlive(room, atkTeam);
+  const defAlive = demoAlive(room, defTeam);
+  if (defAlive === 0 && atkAlive === 0) return demoAwardRound(room, defTeam, 'draw_team_wipe');
+  if (defAlive === 0) return demoAwardRound(room, atkTeam, 'elim');
+  if (atkAlive === 0 && room.demo.bomb.state !== 'planted') return demoAwardRound(room, defTeam, 'elim');
+  demoBroadcast(room, demoSnapshot(room));
+}
+
+function demoOnDisconnect(room, playerId) {
+  if (!room.demo || room.over) return;
+  demoCancelAction(room, 'disconnect');
+  const b = room.demo.bomb;
+  if (b.carrier === playerId) demoBombDrop(room, b.x, b.y);
+  room.dead.delete(playerId); // departed — no longer dead-flagged
+  if (room.demo.phase === 'LIVE') {
+    demoResolveElim(room); // re-run elimination state check while the round is live
+    demoBroadcast(room, demoSnapshot(room));
+  }
+}
+// Draw live elimination state back to a round award when a side is empty.
+function demoResolveElim(room) {
+  const atkT = room.demo.atk, defT = atkT === 'red' ? 'blue' : 'red';
+  const atkAlive = demoAlive(room, atkT), defAlive = demoAlive(room, defT);
+  if (defAlive === 0 && atkAlive === 0) return demoAwardRound(room, defT, 'draw_team_wipe');
+  if (defAlive === 0) return demoAwardRound(room, atkT, 'elim');
+  if (atkAlive === 0 && room.demo.bomb.state !== 'planted') return demoAwardRound(room, defT, 'elim');
+}
+// ══ END DEMOLITION ════════════════════════════════════════════
 
 function findOrCreateRoom(mode, team) {
   for (const [, r] of rooms) {
@@ -214,7 +453,9 @@ function removePlayerFromRoom(sid) {
   if (!c || !c.roomId) return;
   const room = rooms.get(c.roomId);
   if (!room) { c.roomId = null; return; }
+  const demoHook = room.mode === 'demo' ? room : null;
   room.players.delete(sid); room.red.delete(sid); room.blue.delete(sid);
+  if (demoHook) demoOnDisconnect(demoHook, c.playerId);
   broadcastRoom(room.id, {
     type: 'player_left', playerId: c.playerId,
     redCount: room.red.size, blueCount: room.blue.size,
@@ -344,11 +585,14 @@ function handleMsg(ws, sid, msg) {
       if (!room) room = findOrCreateRoom(mode, c.team);
       if (partyCode) parties.set(partyCode, { roomId: room.id });
       addPlayerToRoom(room, sid, c);
+      const dj = (mode === 'demo' && room.demo)
+        ? { demo: demoSnapshot(room), atkTeam: room.demo.atk }
+        : {};
       sendTo(ws, {
         type: 'match_joined', roomId: room.id, team: c.team,
         timeLeft: room.timeLeft, rScore: room.rScore, bScore: room.bScore,
         mode: room.mode, redCount: room.red.size, blueCount: room.blue.size,
-        leaderboard: buildLeaderboard(room),
+        leaderboard: buildLeaderboard(room), ...dj,
       });
       broadcastRoom(room.id, {
         type: 'player_joined', playerId: c.playerId, name: c.name, team: c.team, skin: c.skin || 0,
@@ -371,7 +615,8 @@ function handleMsg(ws, sid, msg) {
       if (!c.roomId) break;
       const room = rooms.get(c.roomId);
       if (!room || room.over) break;
-      if (msg.team === 'red') room.rScore++; else room.bScore++;
+      const isDemo = room.mode === 'demo';
+      if (!isDemo) { if (msg.team === 'red') room.rScore++; else room.bScore++; }
       c.kills++;
       const now = Date.now();
       if (now - c.lastKillMs < STREAK_RESET_MS) c.streak++; else c.streak = 1;
@@ -385,9 +630,13 @@ function handleMsg(ws, sid, msg) {
         rs: room.rScore, bs: room.bScore, streak: c.streak, streakLabel,
       });
       broadcastLeaderboard(room);
-      const winScore = room.mode === 'ctf' ? CTF_WIN_SCORE : TDM_WIN_SCORE;
-      if (room.rScore >= winScore) endRoom(room, 'red');
-      else if (room.bScore >= winScore) endRoom(room, 'blue');
+      if (isDemo) {
+        if (victim) demoOnKill(room, victim.playerId);
+      } else {
+        const winScore = room.mode === 'ctf' ? CTF_WIN_SCORE : TDM_WIN_SCORE;
+        if (room.rScore >= winScore) endRoom(room, 'red');
+        else if (room.bScore >= winScore) endRoom(room, 'blue');
+      }
       break;
     }
     case 'ctf_score': {
@@ -468,6 +717,71 @@ function handleMsg(ws, sid, msg) {
       const ALLOWED_EMOJIS = ['😂','😢','💀','❤️'];
       if (!ALLOWED_EMOJIS.includes(msg.emoji)) break;
       broadcastRoom(c.roomId, { type: 'emoji', id: c.playerId, emoji: msg.emoji }, sid);
+      break;
+    }
+    case 'demo_plant_start': {
+      if (!c.roomId) break;
+      const room = rooms.get(c.roomId);
+      if (!room || room.over || room.mode !== 'demo' || !room.demo) break;
+      const d = room.demo;
+      if (d.phase !== 'LIVE' || d.bomb.state !== 'carried') break;
+      if (d.bomb.carrier !== c.playerId) break;
+      if (d.bomb.actionKind) break;
+      const site = msg.site === 'B' ? 'B' : 'A';
+      d.bomb.site = site; d.bomb.x = msg.x || d.bomb.x; d.bomb.y = msg.y || d.bomb.y;
+      d.bomb.actionKind = 'plant'; d.bomb.actionBy = c.playerId; d.bomb.actionStart = Date.now();
+      demoEvent(room, 'plant_start', { id: c.playerId, site, x: d.bomb.x, y: d.bomb.y });
+      demoBroadcast(room, demoSnapshot(room));
+      break;
+    }
+    case 'demo_plant_cancel': {
+      if (!c.roomId) break;
+      const room = rooms.get(c.roomId);
+      if (!room || room.over || room.mode !== 'demo' || !room.demo) break;
+      if (room.demo.bomb.actionKind === 'plant' && room.demo.bomb.actionBy === c.playerId)
+        demoCancelAction(room, 'cancel');
+      break;
+    }
+    case 'demo_defuse_start': {
+      if (!c.roomId) break;
+      const room = rooms.get(c.roomId);
+      if (!room || room.over || room.mode !== 'demo' || !room.demo) break;
+      const d = room.demo;
+      if (d.phase !== 'LIVE' || d.bomb.state !== 'planted') break;
+      if (c.team === d.atk) break; // attackers cannot defuse
+      if (d.bomb.actionKind) break;
+      d.bomb.actionKind = 'defuse'; d.bomb.actionBy = c.playerId; d.bomb.actionStart = Date.now();
+      demoEvent(room, 'defuse_start', { id: c.playerId });
+      demoBroadcast(room, demoSnapshot(room));
+      break;
+    }
+    case 'demo_defuse_cancel': {
+      if (!c.roomId) break;
+      const room = rooms.get(c.roomId);
+      if (!room || room.over || room.mode !== 'demo' || !room.demo) break;
+      if (room.demo.bomb.actionKind === 'defuse' && room.demo.bomb.actionBy === c.playerId)
+        demoCancelAction(room, 'cancel');
+      break;
+    }
+    case 'demo_bomb_pickup': {
+      if (!c.roomId) break;
+      const room = rooms.get(c.roomId);
+      if (!room || room.over || room.mode !== 'demo' || !room.demo) break;
+      const d = room.demo;
+      if (d.phase !== 'LIVE' || d.bomb.state !== 'dropped') break;
+      if (c.team !== d.atk) break; // only attackers carry the bomb
+      if (room.dead.has(c.playerId)) break;
+      d.bomb.state = 'carried'; d.bomb.carrier = c.playerId;
+      demoEvent(room, 'bomb_pickup', { id: c.playerId });
+      demoBroadcast(room, demoSnapshot(room));
+      break;
+    }
+    case 'demo_bomb_drop_voluntary': {
+      if (!c.roomId) break;
+      const room = rooms.get(c.roomId);
+      if (!room || room.over || room.mode !== 'demo' || !room.demo) break;
+      if (room.demo.bomb.state === 'carried' && room.demo.bomb.carrier === c.playerId)
+        demoBombDrop(room, msg.x || 0, msg.y || 0);
       break;
     }
     default: {
